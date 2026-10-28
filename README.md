@@ -1,7 +1,7 @@
 # transcribe-local
 
-Record a meeting on your own PC and get a speaker-labelled transcript back, without
-anything leaving the machine.
+Record a meeting on your own Windows PC or Mac and get a speaker-labelled transcript
+back, without anything leaving the machine.
 
 - Captures **your microphone and the system output** (the other people on the call)
   at the same time, as a 16 kHz stereo WAV (left = mic, right = system).
@@ -9,16 +9,24 @@ anything leaving the machine.
 - Levels both sides automatically before transcribing, so a quiet laptop mic isn't
   drowned out by loud call audio, and overlapping speech stays audible.
 - Sends it to a local [TranscriptionSuite](https://github.com/homelab-00/TranscriptionSuite)
-  server (Whisper + diarization in Docker) and writes a `.txt` with one line per
-  speaker turn: `[speaker 0] …`, `[speaker 1] …`.
-- Starts the Docker server only for the transcription and stops it again, so it isn't
+  server (Whisper + diarization, in Docker or natively on Apple Silicon) and writes a
+  `.txt` with one line per speaker turn: `[speaker 0] …`, `[speaker 1] …`.
+- Starts the server only for the transcription and stops it again, so it isn't
   holding your GPU and several GB of RAM between meetings.
-- A **system-tray button** to start/stop, a popup for title and speaker count, and a
-  "who is who?" dialog to replace `speaker N` with real names.
+- A **system-tray / menu-bar button** to start/stop, a popup for title and speaker
+  count, and a "who is who?" dialog to replace `speaker N` with real names.
 - Optionally drops a clean Markdown copy of each diarized transcript into a second
   folder, such as a notes app's or knowledge base's inbox.
 
-Windows only: audio capture uses WASAPI loopback, and the tray and watchdog use Win32.
+| | Windows | macOS |
+|---|---|---|
+| System audio | WASAPI loopback (`soundcard`) | Core Audio process tap (Swift helper in `macos/`) |
+| Tray | system tray (`pystray` + Tk) | menu bar (native AppKit via PyObjC) |
+| Server | Docker Compose | native Metal/MLX server on Apple Silicon; Docker on Intel |
+| Start at login + watchdog | Startup shortcut + `watchdog.vbs` | launchd agent + `macos/watchdog.sh` |
+
+The Windows setup comes first below; **on a Mac, jump to [macOS](#macos).** Command
+line options, output, server management and privacy are the same on both.
 
 ## Requirements
 
@@ -183,18 +191,113 @@ path in `PYTHONW` at the top of `watchdog.vbs`. It logs to `watchdog.log`.
 To undo: delete **Meeting Recorder** from `shell:startup` (Win+R → `shell:startup`) and
 run `Unregister-ScheduledTask -TaskName MeetingRecorderWatchdog`.
 
+## macOS
+
+Everything above works on a Mac too; only setup, capture and autostart differ.
+
+### Requirements
+
+- macOS 14.2 or later (Sonoma, Sequoia, Tahoe); Apple Silicon recommended
+- Xcode command line tools, for the small audio helper: `xcode-select --install`
+- Python 3.10+ (e.g. `brew install python`); tkinter is **not** needed
+- TranscriptionSuite: on **Apple Silicon** the `…-arm64-mac-metal.dmg` from its
+  [releases page](https://github.com/homelab-00/TranscriptionSuite/releases) (no Docker
+  needed); on an **Intel Mac** Docker Desktop plus the regular build
+
+### Install
+
+```bash
+git clone https://github.com/bombos-ai/transcribe-local.git
+cd transcribe-local
+macos/install.sh
+```
+
+That creates `.venv`, installs the packages, builds the audio helper
+(`macos/build/audiocap`) and installs a **login item**: the menu-bar icon appears now
+and after every login, launchd restarts it if it crashes, and a watchdog restarts it
+if it hangs (never while it's recording). Use `macos/install.sh --no-login` to skip
+the login item and start it yourself with `.venv/bin/python meeting_tray.py`.
+
+Set up the server once:
+
+1. **Apple Silicon:** install TranscriptionSuite in `/Applications` (it's unsigned:
+   `xattr -dr com.apple.quarantine /Applications/TranscriptionSuite.app`), open it, pick
+   the **Metal** runtime and your models in the Server tab, give it a Hugging Face
+   token if you want PyAnnote diarization, start it once so it downloads the models,
+   and make one test transcription. Then stop the server and close the dashboard.
+   The recorder starts the same server itself from then on, with the dashboard's model
+   choices and token.
+2. **Intel:** as in [step 2](#2-set-up-the-transcription-server-once) above; the
+   Compose folder is `~/Library/Application Support/TranscriptionSuite/docker`.
+
+### Allow the audio permissions
+
+Run the self-test once from a terminal, with some audio playing, and talk:
+
+```bash
+.venv/bin/python meeting_recorder.py --selftest
+```
+
+macOS asks twice, both times for **"audiocap"**: *System Audio Recording* (the other
+side of the call) and *Microphone* (you). Allow both. They're remembered for the helper
+whatever starts it: terminal, menu bar or login item. If you clicked Don't Allow, turn
+it on in **System Settings › Privacy & Security › Screen & System Audio Recording**
+(the "System Audio Recording Only" list) and **› Microphone**.
+
+The tap records **everything the Mac plays**, through whichever output is active, and
+keeps following it when you switch to AirPods mid-call. There's no "default output"
+to set up, and no BlackHole needed. The mic follows the system's default input;
+set `MIC_NAME` to pin one (`--list-devices` shows them).
+
+### Menu bar
+
+- **Click the icon** to start recording: it turns red and shows a running clock.
+- **Click again** to stop. The same title / speakers / diarization / language window
+  and "who is who?" window as on Windows follow. The icon is amber while the server
+  starts and transcribes.
+- **Right-click** (or Control-click) for the menu: *Transcribe an existing WAV…*,
+  *Name speakers in a transcript…*, *Open transcripts folder*, *Quit*.
+
+On a MacBook with a notch, a crowded menu bar can hide icons behind the notch;
+⌘-drag the icon further right if you don't see it.
+
+### Configure
+
+The same `TRANSCRIPTION_*` variables as above, plus:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TRANSCRIPTION_SERVER_MODE` | `auto` | `metal`, `docker`, or `auto` (metal when TranscriptionSuite's Metal backend is installed). |
+| `TRANSCRIPTION_SUITE_APP` | `/Applications/TranscriptionSuite.app` | Where TranscriptionSuite is installed. |
+
+Export them in your shell profile for terminal use. The login item gets a copy of the
+`TRANSCRIPTION_*` variables that are set when you run `macos/install.sh`, so re-run it
+after changing one.
+
+### Logs and undo
+
+`tray.log`, `watchdog.log` and `metal-server.log` (the native server's output) are
+written next to the scripts. `macos/install.sh --uninstall` removes the login item
+and watchdog.
+
 ## How the server is managed
 
-- Transcription runs `docker compose up -d` in the Compose folder, waits for `/health`,
-  transcribes, then runs `docker compose down` in the background (the server drains
-  for up to ~2 minutes; the next start waits for that to finish).
+- **Docker mode** (Windows, Intel Macs): transcription runs `docker compose up -d` in the
+  Compose folder, waits for `/health`, transcribes, then runs `docker compose down` in
+  the background (the server drains for up to ~2 minutes; the next start waits for that
+  to finish).
+- **Metal mode** (Apple Silicon): it starts TranscriptionSuite's own server process
+  (`python -m uvicorn server.api.main:app` from the app bundle, on `127.0.0.1:9786`)
+  with the dashboard's model choices, waits for `/health`, transcribes, then stops it.
 - If the server was **already running** (for example you opened the dashboard), it's
   used as-is and left running. Only a server this tool started gets stopped.
 - Several transcriptions can run at once from the tray; the server stays up until the
   last one is done.
-- If the process dies mid-job, an exit hook still stops the server.
-- The PC is kept from sleeping while recording and while transcribing (the screen can
-  still lock), so standby can't stall a long job.
+- If the process dies mid-job, an exit hook still stops the server. A native server
+  that outlived a hard crash is recognised by its pid file and stopped after the next
+  transcription.
+- The computer is kept from sleeping while recording and while transcribing (the screen
+  can still lock), so standby can't stall a long job.
 - By default no `-f`/`-p` flags are passed; the dashboard's `.env` pins `COMPOSE_FILE`
   and `COMPOSE_PROJECT_NAME`, so this tool and the dashboard always agree on the stack.
   `TRANSCRIPTION_COMPOSE_FILES` overrides that for a manual checkout.
@@ -225,11 +328,19 @@ With `TRANSCRIPTION_INBOX_DIR` set, also `2026-10-28-transcript-weekly-sync.md` 
   recording…** or `--file`.
 - **Tray icon gone.** Check `tray.log`. With the watchdog installed it comes back within
   5 minutes.
+- **Mac: `system=` or `mic=` stays 0.** The "audiocap" permission is off; see
+  [Allow the audio permissions](#allow-the-audio-permissions). Rebuilding the helper
+  after it has *changed* (e.g. a `git pull` that touched `macos/audiocap.swift`) makes
+  macOS ask again.
+- **Mac: "Metal server exited".** The last lines of `metal-server.log` are in the
+  message; usually the models aren't downloaded yet. Start the server once from the
+  TranscriptionSuite dashboard.
 
 ## Privacy
 
 Audio and transcripts stay on your machine; this tool's only network call is to the
-server on `localhost`. You are recording other people: tell them, and follow the consent rules
+server on `localhost`. (The server itself downloads its models from Hugging Face the
+first time it starts.) You are recording other people: tell them, and follow the consent rules
 that apply to you.
 
 ## License

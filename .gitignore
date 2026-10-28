@@ -223,3 +223,6 @@ __marimo__/
 tray.heartbeat
 *.wav
 recordings/
+tray.lock
+metal-server.pid
+macos/build/

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>local.transcribe-local.audiocap</string>
+	<key>CFBundleName</key>
+	<string>audiocap</string>
+	<key>CFBundleDisplayName</key>
+	<string>Meeting Recorder audio capture</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Meeting Recorder records your voice during a meeting.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Meeting Recorder records what the other people on the call say.</string>
+</dict>
+</plist>

@@ -21,17 +21,23 @@ Usage:
     python meeting_recorder.py --server-up     # start the server and leave it up
     python meeting_recorder.py --server-down   # stop the server
 
-The transcription server is a Docker Compose stack that only runs while it is
-needed: it is brought up when transcription starts and taken down when it
-finishes. A server that was already running (e.g. the Electron dashboard's) is
-used as-is and left alone.
+The transcription server only runs while it is needed: it is brought up when
+transcription starts and taken down when it finishes. On Windows (and Intel
+Macs) that's TranscriptionSuite's Docker Compose stack; on Apple Silicon it's
+the dashboard's native Metal/MLX server process. A server that was already
+running (e.g. the Electron dashboard's) is used as-is and left alone.
+
+Platforms:
+  Windows  mic + WASAPI loopback via `soundcard`
+  macOS    mic + a Core Audio process tap via the small Swift helper in
+           macos/ (built on first use; needs the Xcode command line tools)
 
 Settings come from environment variables or a .env file next to this script
 (see .env.example).
 
-Deps:  pip install soundcard numpy requests   (plus the `docker` CLI on PATH)
+Deps:  pip install -r requirements.txt   (plus the `docker` CLI on PATH for Docker mode)
 """
-import argparse, atexit, contextlib, datetime, os, re, subprocess, sys, threading, time, wave, json, queue, warnings
+import argparse, atexit, contextlib, datetime, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, queue, warnings
 import numpy as np
 import requests
 
@@ -71,7 +77,7 @@ AUDIO_DIR   = os.path.join(OUTPUT_DIR, "recordings")  # WAVs kept here
 # (e.g. a notes app's or knowledge base's inbox). Off when unset.
 INBOX_DIR   = os.environ.get("TRANSCRIPTION_INBOX_DIR") or None
 LANGUAGE    = os.environ.get("TRANSCRIPTION_LANGUAGE") or "nl"
-CAPTURE_SR  = 48000          # WASAPI native
+CAPTURE_SR  = 48000          # WASAPI native; the macOS helper resamples to it
 TARGET_SR   = 16000          # what we send (48000/16000 = 3, clean decimation)
 DECIM       = CAPTURE_SR // TARGET_SR
 BLOCK       = 4800           # 100 ms at 48 kHz
@@ -90,17 +96,41 @@ MIC_NAME    = None           # substring to pick a mic; None = default input
 # dashboard's own (whose .env pins COMPOSE_FILE and COMPOSE_PROJECT_NAME), or a
 # manual checkout. TRANSCRIPTION_COMPOSE_FILES (separated by ';' on Windows)
 # picks the -f files explicitly, for a checkout whose .env doesn't pin them.
+MACOS       = sys.platform == "darwin"
+# The dashboard's app-data folder (Electron userData).
+TS_DATA_DIR = (os.path.expanduser("~/Library/Application Support/TranscriptionSuite") if MACOS
+               else os.path.join(os.environ.get("APPDATA", ""), "TranscriptionSuite"))
 COMPOSE_DIR = os.environ.get("TRANSCRIPTION_COMPOSE_DIR") or next(
-    (d for d in (os.path.join(os.environ.get("APPDATA", ""), "TranscriptionSuite", "docker"),
+    (d for d in (os.path.join(TS_DATA_DIR, "docker"),
                  os.path.join(os.path.expanduser("~"), "TranscriptionSuite", "docker"))
      if os.path.isdir(d)),
-    os.path.join(os.environ.get("APPDATA", ""), "TranscriptionSuite", "docker"))
+    os.path.join(TS_DATA_DIR, "docker"))
 COMPOSE_FILES = [f for f in (os.environ.get("TRANSCRIPTION_COMPOSE_FILES") or "").split(os.pathsep) if f]
 SERVER_START_TIMEOUT = 900   # first start bootstraps a venv + models; be generous
 SERVER_STOP_TIMEOUT  = 180   # stop_grace_period is 130s
 # CPU-only servers are slow on long meetings, so allow plenty of time.
 SERVER_TIMEOUT = 4 * 3600
+
+# How the server is run: "docker" (Compose stack, above) or "metal" (macOS on
+# Apple Silicon: the dashboard's native MLX server, a plain uvicorn process
+# from its app bundle). "auto" picks metal when that backend is installed.
+SERVER_MODE = (os.environ.get("TRANSCRIPTION_SERVER_MODE") or "auto").lower()
+TS_APP      = os.environ.get("TRANSCRIPTION_SUITE_APP")       # default: /Applications/TranscriptionSuite.app
+
+_HERE         = os.path.dirname(os.path.abspath(__file__))
+AUDIOCAP      = os.path.join(_HERE, "macos", "build", "audiocap")   # macOS capture helper
+METAL_PIDFILE = os.path.join(_HERE, "metal-server.pid")
+METAL_LOG     = os.path.join(_HERE, "metal-server.log")
 # -----------------------------------------------------------------------
+
+# Apps started by launchd or Finder get PATH=/usr/bin:/bin:/usr/sbin:/sbin, which
+# has neither `docker` nor Homebrew's tools.
+if MACOS:
+    _path = os.environ.get("PATH", "").split(os.pathsep)
+    for _d in ("/usr/local/bin", "/opt/homebrew/bin"):
+        if _d not in _path:
+            _path.insert(0, _d)
+    os.environ["PATH"] = os.pathsep.join(_path)
 
 
 def _ts():
@@ -111,11 +141,29 @@ def _ts():
 # lock-then-sleep can't cut the capture off, and Modern Standby can't throttle
 # the server's Docker VM to a crawl mid-transcription (a 2.5 h file once spent
 # 3+ hours of its timeout in standby). The screen may still turn off and lock —
-# we only block system sleep, not the display. The flag is per thread, so a
-# recording and a transcription running side by side don't clear each other.
+# we only block system sleep, not the display. A recording and a transcription
+# running side by side mustn't clear each other: on Windows the flag is per
+# thread; on macOS one process-wide `caffeinate` is shared, so it's counted.
 _ES_CONTINUOUS       = 0x80000000
 _ES_SYSTEM_REQUIRED  = 0x00000001
+_caffeinate = None           # macOS: a `caffeinate` child holding the assertion
+_awake_users = 0             # macOS: callers currently wanting it held
+_awake_lock = threading.Lock()
 def _keep_awake(on):
+    global _caffeinate, _awake_users
+    if MACOS:
+        with _awake_lock:
+            _awake_users = _awake_users + 1 if on else max(_awake_users - 1, 0)
+            if _awake_users and _caffeinate is None:
+                with contextlib.suppress(Exception):
+                    # -i: no idle sleep; -w: let go by itself if we die
+                    _caffeinate = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+            elif not _awake_users and _caffeinate is not None:
+                with contextlib.suppress(Exception):
+                    _caffeinate.terminate()
+                    _caffeinate.wait(5)
+                _caffeinate = None
+        return
     if sys.platform != "win32":
         return
     try:
@@ -127,6 +175,10 @@ def _keep_awake(on):
 
 
 def list_devices():
+    if MACOS:
+        subprocess.run([audiocap_path(), "list"], check=False)
+        print("(system audio is a tap on everything the Mac plays, whichever output it goes to)")
+        return
     import soundcard as sc
     print("=== Microphones (inputs) ===")
     for m in sc.all_microphones(include_loopback=True):
@@ -136,7 +188,87 @@ def list_devices():
     print(f"Default speaker: {sc.default_speaker().name}  (its loopback is what we capture as 'system')")
 
 
+# --------------------------------------------------- macOS capture helper
+def audiocap_path():
+    """The Swift capture helper, built on first use (and after an edit)."""
+    src = os.path.join(_HERE, "macos", "audiocap.swift")
+    stale = (not os.path.exists(AUDIOCAP) or
+             (os.path.exists(src) and os.path.getmtime(src) > os.path.getmtime(AUDIOCAP)))
+    if stale:
+        print("Building the audio capture helper (macos/build.sh)…")
+        cp = subprocess.run(["/bin/bash", os.path.join(_HERE, "macos", "build.sh")],
+                            capture_output=True, text=True)
+        if cp.returncode != 0 or not os.path.exists(AUDIOCAP):
+            tail = "\n".join((cp.stderr or cp.stdout or "").strip().splitlines()[-6:])
+            raise RuntimeError("Could not build the audio capture helper. Install the Xcode command "
+                               f"line tools (xcode-select --install) and run macos/build.sh.\n{tail}")
+    return AUDIOCAP
+
+
+class _HelperSource:
+    """A soundcard-shaped capture source backed by `audiocap mic|system`, so
+    record_session() doesn't care which platform it's on."""
+    def __init__(self, mode, name, device=None):
+        self.mode, self.name, self.device = mode, name, device
+
+    def recorder(self, samplerate, channels, blocksize=None):
+        # blocksize is soundcard's WASAPI buffer size; the helper's pipe buffers for us
+        assert samplerate == CAPTURE_SR
+        return _HelperRecorder(self.mode, channels, self.device)
+
+
+class _HelperRecorder:
+    def __init__(self, mode, channels, device):
+        self.mode, self.channels, self.device = mode, channels, device
+        self.proc, self.err_tail = None, []
+
+    def __enter__(self):
+        cmd = [audiocap_path(), self.mode] + (["--device", self.device] if self.device else [])
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     stdin=subprocess.DEVNULL, bufsize=0)
+        threading.Thread(target=self._pump_stderr, daemon=True).start()
+        return self
+
+    def _pump_stderr(self):
+        for raw in self.proc.stderr:
+            line = raw.decode("utf-8", "replace").rstrip()
+            self.err_tail = (self.err_tail + [line])[-5:]
+            print(line)
+
+    def record(self, numframes):
+        want = numframes * self.channels * 4
+        buf = bytearray()
+        while len(buf) < want:
+            chunk = self.proc.stdout.read(want - len(buf))
+            if not chunk:
+                self.proc.wait()
+                time.sleep(0.2)                      # let the stderr pump catch up
+                why = "; ".join(self.err_tail) or f"exit code {self.proc.returncode}"
+                raise RuntimeError(f"{self.mode} capture stopped: {why}")
+            buf += chunk
+        return np.frombuffer(bytes(buf), dtype="<f4").reshape(-1, self.channels)
+
+    def __exit__(self, *exc):
+        with contextlib.suppress(Exception):
+            self.proc.terminate()
+            self.proc.wait(3)
+        with contextlib.suppress(Exception):
+            self.proc.kill()
+
+
+def _mac_default_names():
+    """(default mic, default output) as shown by `audiocap list`."""
+    out = subprocess.run([audiocap_path(), "list"], capture_output=True, text=True).stdout
+    names = dict(re.findall(r"^Default (mic|speaker):\s+(.*)$", out, re.M))
+    return names.get("mic", "default input"), names.get("speaker", "default output")
+
+
 def _open_streams(sc):
+    if sc is None:                                    # macOS
+        mic_name, spk_name = _mac_default_names()
+        mic_dev = _HelperSource("mic", f"{MIC_NAME} (match)" if MIC_NAME else mic_name, MIC_NAME)
+        loop_dev = _HelperSource("system", "system audio")
+        return mic_dev, loop_dev, _HelperSource("system", f"process tap on all output (now: {spk_name})")
     mic_dev = sc.default_microphone()
     if MIC_NAME:
         mic_dev = sc.get_microphone(MIC_NAME, include_loopback=False)
@@ -149,10 +281,22 @@ def _capture_loop(recorder_ctx, q, stop_event):
     """Drain one WASAPI stream continuously into a queue. Running each stream in
     its own thread means neither buffer overflows while the other is processed,
     which is what caused the 'data discontinuity' drops (and slow mic/system
-    desync over a long meeting)."""
-    with recorder_ctx as rec:
-        while not stop_event.is_set():
-            q.put(rec.record(numframes=BLOCK))
+    desync over a long meeting). A failure is queued too, so the mixer raises
+    it instead of waiting forever on a stream that has died."""
+    try:
+        with recorder_ctx as rec:
+            while not stop_event.is_set():
+                q.put(rec.record(numframes=BLOCK))
+    except Exception as e:
+        if not stop_event.is_set():
+            q.put(e)
+
+
+def _take(q, timeout):
+    item = q.get(timeout=timeout)
+    if isinstance(item, Exception):
+        raise item
+    return item
 
 
 _dropouts = 0
@@ -180,11 +324,14 @@ def record_session(wav_path, stop_event, selftest_seconds=None):
     balanced later, at transcription time (see mix_for_upload), so the raw
     recording can always be remixed. Memory stays flat: each block is downsampled
     and written immediately. Blocks are paired 1:1, so the two streams stay in sync."""
-    import soundcard as sc
+    if MACOS:
+        sc = None
+    else:
+        import soundcard as sc
     _count_dropouts()
     mic_dev, loop_dev, spk = _open_streams(sc)
     print(f"Mic:    {mic_dev.name}")
-    print(f"System: {spk.name} (loopback)")
+    print(f"System: {spk.name}" + ("" if MACOS else " (loopback)"))
     os.makedirs(os.path.dirname(wav_path), exist_ok=True)
 
     # 0.5 s WASAPI buffers: soundcard's default (one ~10 ms device period) drops
@@ -223,21 +370,39 @@ def record_session(wav_path, stop_event, selftest_seconds=None):
         t_mic.start(); t_sys.start()
         print("● Recording…  (press Enter to stop)" if selftest_seconds is None
               else f"● Self-test: capturing {selftest_seconds}s…")
+        # The streams rarely start at the same instant (on macOS the very first
+        # run even waits for a permission prompt). Pair them from the moment
+        # both are live, dropping whatever the early one captured before that.
+        mic = sysd = None
+        while not stop_event.is_set() and (mic is None or sysd is None):
+            with contextlib.suppress(queue.Empty):
+                mic = mic if mic is not None else _take(mic_q, 0.2)
+                sysd = sysd if sysd is not None else _take(sys_q, 0.2)
+        if mic is not None and sysd is not None:
+            while mic_q.qsize() > 1 and not isinstance(mic_q.queue[0], Exception):
+                mic = mic_q.get()
+            while sys_q.qsize() > 1 and not isinstance(sys_q.queue[0], Exception):
+                sysd = sys_q.get()
+            _mix_write(mic, sysd)
+        mic = None
         t0 = time.monotonic()
         while not stop_event.is_set():
             try:
-                mic = mic_q.get(timeout=1.0)
-                sysd = sys_q.get(timeout=1.0)
+                if mic is None:               # keep a mic block while its partner is late
+                    mic = _take(mic_q, 1.0)
+                sysd = _take(sys_q, 1.0)
             except queue.Empty:
                 continue
             _mix_write(mic, sysd)
+            mic = None
             if selftest_seconds is not None and time.monotonic() - t0 >= selftest_seconds:
                 break
     finally:
         cap_stop.set()
         # drain whatever both streams already captured, keeping them paired
-        while not mic_q.empty() and not sys_q.empty():
-            _mix_write(mic_q.get(), sys_q.get())
+        drained = [[x for x in list(q_.queue) if not isinstance(x, Exception)] for q_ in (mic_q, sys_q)]
+        for m, s in zip(*drained):
+            _mix_write(m, s)
         wf.close()
         _keep_awake(False)                # allow sleep again
     secs = blocks * BLOCK / CAPTURE_SR
@@ -372,18 +537,219 @@ def _compose(*args, timeout=None):
     return cp.stdout
 
 
-# Several transcriptions can run at once in the tray, so the stack is
+# Several transcriptions can run at once in the tray, so the server is
 # reference-counted: the first user brings it up, the last one takes it down —
 # and only if this process started it.
 _srv_lock = threading.Lock()
 _srv_users = 0              # transcriptions in flight in this process
-_owned = False              # True while THIS process is the one keeping the stack up
-_stopping = None            # Popen of an in-flight `docker compose down`
+_owned = False              # True while THIS process is the one keeping the server up
+_stopping = None            # an in-flight background teardown (Popen or Thread)
+
+
+# --- native Metal/MLX server (macOS, Apple Silicon) -----------------------
+# Started exactly the way the dashboard's mlxServerManager does it: the app
+# bundle's own venv python running uvicorn, with the dashboard's model choices
+# and Hugging Face token passed in through the environment.
+def _metal_backend_dir():
+    """TranscriptionSuite's server/backend folder (with its .venv), or None."""
+    apps = [TS_APP] if TS_APP else ["/Applications/TranscriptionSuite.app",
+                                    os.path.expanduser("~/Applications/TranscriptionSuite.app")]
+    for d in [os.path.join(a, "Contents", "Resources", "backend") for a in apps]:
+        if os.path.isfile(os.path.join(d, ".venv", "bin", "python3")):
+            return d
+    return None
+
+
+def server_mode():
+    if SERVER_MODE in ("docker", "metal"):
+        return SERVER_MODE
+    return "metal" if MACOS and _metal_backend_dir() else "docker"
+
+
+def _dashboard_settings():
+    with contextlib.suppress(Exception), open(os.path.join(TS_DATA_DIR, "dashboard-config.json"), encoding="utf-8") as f:
+        return json.load(f)
+    return {}
+
+
+def _metal_env():
+    """Mirror of mlxServerManager.start() + main.ts's auto-start model resolution."""
+    st = _dashboard_settings()
+    data = os.path.join(TS_DATA_DIR, "data")
+    for d in ("logs", "audio", "tokens"):
+        os.makedirs(os.path.join(data, d), exist_ok=True)
+    env = dict(os.environ, DATA_DIR=data, HF_HOME=os.path.join(TS_DATA_DIR, "models"),
+               USER_CONFIG_DIR=os.path.join(TS_DATA_DIR, "server-config"),
+               LOG_DIR=os.path.join(data, "logs"), LOG_LEVEL="INFO", PYTHONUNBUFFERED="1")
+    ffmpeg = os.path.join(os.path.dirname(_metal_backend_dir()), "ffmpeg")   # bundled fallback
+    if os.path.isfile(os.path.join(ffmpeg, "ffmpeg")):
+        env["PATH"] = env.get("PATH", "") + os.pathsep + ffmpeg
+    # The dashboard's token wins; else HF_TOKEN / HUGGINGFACE_TOKEN from our env or .env.
+    tok = st.get("server.hfToken") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if tok:
+        env["HF_TOKEN"] = tok
+
+    main = st.get("server.mainModelSelection") or "mlx-community/whisper-small-asr-fp16"
+    env["MAIN_TRANSCRIBER_MODEL"] = main
+    live_sel = st.get("server.liveModelSelection") or ""
+    if live_sel in ("None (Disabled)", "__none__"):
+        live = ""
+    elif not live_sel or live_sel == "Same as Main Transcriber":
+        live = main
+    elif live_sel == "Custom (HuggingFace repo)":
+        live = st.get("server.liveCustomModel") or main
+    else:
+        live = live_sel
+    if live and re.search("mlx", live, re.I):
+        live = "Systran/faster-whisper-medium"       # live mode can't run MLX models
+    if live:
+        env["LIVE_TRANSCRIBER_MODEL"] = live
+    diar_sel = st.get("server.diarizationModelSelection") or ""
+    if diar_sel == "Custom (HuggingFace repo)":
+        diar = (st.get("server.diarizationCustomModel") or "").strip()
+    elif diar_sel in ("", "CAM++ (fast, built-in)", "Sortformer (Metal; ≤ 4 speakers)", "Auto (best available)"):
+        diar = ""                                    # let the server pick
+    elif diar_sel.lower() == "pyannote/speaker-diarization-community-1":
+        diar = ""                                    # the server-config overlay decides
+    else:
+        diar = diar_sel
+    if diar:
+        env["DIARIZATION_MODEL"] = diar
+    return env
+
+
+def _metal_pid():
+    """PID of a Metal server we started (possibly in an earlier run), or None."""
+    with contextlib.suppress(Exception):
+        with open(METAL_PIDFILE) as f:
+            pid = int(f.read().split()[0])
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        if "server.api.main" in cmd:                 # guard against a recycled pid
+            return pid
+    return None
+
+
+_metal_proc = None
+
+
+def _metal_up():
+    global _metal_proc
+    backend = _metal_backend_dir()
+    if not backend:
+        raise ServerStartError("TranscriptionSuite's Metal server isn't installed. Install the "
+                               "arm64-mac-metal build of TranscriptionSuite in /Applications "
+                               "(or set TRANSCRIPTION_SUITE_APP).")
+    log = open(METAL_LOG, "a", buffering=1, encoding="utf-8")
+    log.write(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} starting Metal server =====\n")
+    _metal_proc = subprocess.Popen(
+        [os.path.join(backend, ".venv", "bin", "python3"), "-m", "uvicorn", "server.api.main:app",
+         "--host", "127.0.0.1", "--port", str(urllib.parse.urlparse(SERVER).port or 9786)],
+        # Run from Resources/: the packaged backend lives in site-packages, so the
+        # server only finds its bundled defaults (Resources/config.yaml) through
+        # its current-directory fallback.
+        cwd=os.path.dirname(backend), env=_metal_env(),
+        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)                     # its own process group; we stop it explicitly
+    log.close()
+    with open(METAL_PIDFILE, "w") as f:
+        f.write(f"{_metal_proc.pid}\n")
+
+
+def _metal_failed():
+    """Why a Metal server we're starting has already died, else None."""
+    if _metal_proc is None or _metal_proc.poll() is None:
+        return None
+    tail = ""
+    with contextlib.suppress(Exception), open(METAL_LOG, encoding="utf-8", errors="replace") as f:
+        tail = "\n".join(f.read().strip().splitlines()[-6:])
+    return f"Metal server exited with code {_metal_proc.returncode}:\n{tail}\n(full log: {METAL_LOG})"
+
+
+def _metal_down(timeout=SERVER_STOP_TIMEOUT, explicit=False):
+    """Stop the Metal server we started: its whole process group (it runs in a
+    session of its own). Only an explicit --server-down also stops one we didn't
+    start (e.g. the dashboard's) — and then just that process, never its group,
+    which may be the dashboard app's own."""
+    global _metal_proc
+    pid = _metal_proc.pid if _metal_proc and _metal_proc.poll() is None else _metal_pid()
+    group = pid is not None
+    if pid is None and explicit:
+        out = subprocess.run(["pgrep", "-f", "uvicorn server.api.main:app"],
+                             capture_output=True, text=True).stdout.split()
+        pid = int(out[0]) if out else None
+
+    def _signal(sig):
+        with contextlib.suppress(ProcessLookupError):
+            if group:
+                os.killpg(os.getpgid(pid), sig)
+            else:
+                os.kill(pid, sig)
+
+    if pid is not None:
+        _signal(signal.SIGTERM)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and _pid_alive(pid):
+            time.sleep(0.5)
+        if _pid_alive(pid):
+            _signal(signal.SIGKILL)
+    if _metal_proc is not None:
+        with contextlib.suppress(Exception):
+            _metal_proc.wait(5)                     # reap it
+    _metal_proc = None
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(METAL_PIDFILE)
+
+
+def _pid_alive(pid):
+    if _metal_proc is not None and _metal_proc.pid == pid:
+        return _metal_proc.poll() is None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _backend_up():
+    if server_mode() == "metal":
+        _metal_up()
+    else:
+        _compose("up", "-d", timeout=300)
+
+
+def _backend_down(wait=True, explicit=False):
+    """Stop the server. wait=False runs it in the background and remembers it in
+    _stopping, so the next start_server waits for it to finish."""
+    global _stopping
+    if server_mode() == "metal":
+        if wait:
+            _metal_down(explicit=explicit)
+        else:
+            _stopping = threading.Thread(target=_metal_down, daemon=True)
+            _stopping.start()
+    elif wait:
+        _compose("down", timeout=SERVER_STOP_TIMEOUT)
+    else:
+        _stopping = subprocess.Popen(_compose_cmd("down"), cwd=COMPOSE_DIR, env=_compose_env(),
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     creationflags=_NO_WINDOW)
+
+
+def _disown():
+    """Leave a server we started running on purpose (--server-up, --keep-server):
+    it's no longer ours to stop, nor a leftover to adopt next time."""
+    global _owned
+    _owned = False
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(METAL_PIDFILE)
 
 
 def _stop_if_owned():
     """Last line of defence: if the process exits mid-transcription (tray Quit,
-    Ctrl-C), don't leave the stack — and the GPU — occupied."""
+    Ctrl-C), don't leave the server — and the GPU — occupied."""
     if _owned:
         with contextlib.suppress(Exception):
             stop_server()
@@ -404,12 +770,15 @@ def _wait_for_stop():
     global _stopping
     if _stopping is not None:
         with contextlib.suppress(Exception):
-            _stopping.wait(timeout=SERVER_STOP_TIMEOUT)
+            if isinstance(_stopping, threading.Thread):
+                _stopping.join(timeout=SERVER_STOP_TIMEOUT)
+            else:
+                _stopping.wait(timeout=SERVER_STOP_TIMEOUT)
         _stopping = None
 
 
 def start_server(progress=None, timeout=SERVER_START_TIMEOUT):
-    """Bring the transcription stack up and wait until /health answers.
+    """Bring the transcription server up and wait until /health answers.
 
     Returns True if WE started it (so the caller should stop it again), False if
     it was already running — someone else's session, e.g. the Electron
@@ -418,12 +787,18 @@ def start_server(progress=None, timeout=SERVER_START_TIMEOUT):
     say = progress or (lambda m: print(m))
     _wait_for_stop()
     if server_healthy():
+        if not _owned and server_mode() == "metal" and _metal_pid():
+            # Left behind by an earlier run of ours that died mid-job: adopt it,
+            # so it's stopped again like any server we started.
+            say("Reusing the transcription server a previous run left behind.")
+            _owned = True
+            return True
         if not _owned:
             say("Transcription server already running — leaving it alone.")
         return False
     say("Starting transcription server…")
     try:
-        _compose("up", "-d", timeout=300)
+        _backend_up()
     except ServerStartError:
         raise
     except Exception as e:
@@ -435,41 +810,43 @@ def start_server(progress=None, timeout=SERVER_START_TIMEOUT):
         if server_healthy():            # /health only answers once the model is loaded
             say("Transcription server is up.")
             return True
+        failed = _metal_failed() if server_mode() == "metal" else None
+        if failed:
+            with contextlib.suppress(Exception):
+                stop_server()
+            raise ServerStartError(failed)
         now = time.monotonic()
         if now - last >= 30:
             last = now
             say(f"Waiting for the server to become healthy… ({int(deadline - now)}s left)")
         time.sleep(2)
-    # Don't leave a half-started stack behind on a failed bring-up.
+    # Don't leave a half-started server behind on a failed bring-up.
     with contextlib.suppress(Exception):
         stop_server()
     raise ServerStartError(f"Transcription server did not become healthy within {timeout}s.")
 
 
-def stop_server(progress=None, wait=True):
-    """`docker compose down`. wait=False fires it off in the background: the
-    server drains gracefully (up to ~130 s) and nothing needs to sit through
-    that; the next start_server waits for it to finish."""
-    global _owned, _stopping
+def stop_server(progress=None, wait=True, explicit=False):
+    """Stop the server. wait=False fires it off in the background: the server
+    drains gracefully (up to ~130 s) and nothing needs to sit through that; the
+    next start_server waits for it to finish. explicit=True (--server-down) also
+    stops a native server this tool didn't start."""
+    global _owned
     say = progress or (lambda m: print(m))
     say("Stopping transcription server…")
     _owned = False
+    _backend_down(wait=wait, explicit=explicit)
     if wait:
-        _compose("down", timeout=SERVER_STOP_TIMEOUT)
         say("Transcription server stopped.")
-    else:
-        _stopping = subprocess.Popen(_compose_cmd("down"), cwd=COMPOSE_DIR, env=_compose_env(),
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     creationflags=_NO_WINDOW)
 
 
 @contextlib.contextmanager
 def transcription_server(progress=None, manage=True, keep_up=False):
     """Have the server running for the duration of the block.
 
-    manage=False leaves Docker entirely alone (server already handled elsewhere).
+    manage=False leaves the server entirely alone (already handled elsewhere).
     keep_up=True starts it if needed but never stops it."""
-    global _owned, _srv_users
+    global _srv_users
     if not manage:
         yield
         return
@@ -482,7 +859,7 @@ def transcription_server(progress=None, manage=True, keep_up=False):
         with _srv_lock:
             _srv_users -= 1
             if keep_up:
-                _owned = False                  # deliberately left running; disown it
+                _disown()                       # deliberately left running
             elif _owned and _srv_users == 0:
                 # A teardown failure must never mask a finished transcript.
                 try:
@@ -671,6 +1048,68 @@ def title_from_txt(txt_path):
     return "" if stem[:10].count("-") == 2 else stem
 
 
+# ------------------------------------------------------- tray job (both trays)
+def stamp_from_wav(wav):
+    """Use the WAV's own filename (which is a recording timestamp) as the base
+    for the transcript files, so text stays associated with its audio."""
+    base = os.path.splitext(os.path.basename(wav))[0]
+    return base or _ts()
+
+
+def transcription_job(wav, title, speakers, diar, lang, progress):
+    """The tray's whole "Transcribe" action: transcribe (transcribe_file starts
+    the server if needed and takes it down again on every exit path), then write
+    the transcript. Never raises. Returns the tray's next UI step:
+      ("result", {ok, title, body, folder})      a failure to show, or
+      ("name",   {txt, then, title, new=True})   the who-is-who dialog, then `then`."""
+    audio_dir = os.path.dirname(wav)
+    try:
+        result = transcribe_file(wav, language=lang, diarization=diar,
+                                 expected_speakers=speakers, progress=progress)
+    except ServerStartError as e:
+        return ("result", {"ok": False, "title": "Server didn't start",
+            "body": f"{e}\n\nYour audio is safe — retry via\n"
+                    "the tray menu → “Transcribe an existing recording…”:\n" + wav,
+            "folder": audio_dir})
+    except requests.exceptions.ConnectionError:
+        return ("result", {"ok": False, "title": "Server unreachable",
+            "body": "Lost the connection to the transcription server on :9786\n"
+                    "(did it crash or run out of memory?).\n\nYour audio is safe — retry via\n"
+                    "the tray menu → “Transcribe an existing recording…”:\n" + wav,
+            "folder": audio_dir})
+    except (requests.exceptions.ReadTimeout, TimeoutError):
+        return ("result", {"ok": False, "title": "Transcription timed out",
+            "body": "The server didn't finish in time.\n\nYour audio is safe:\n" + wav,
+            "folder": audio_dir})
+    except Exception as e:
+        return ("result", {"ok": False, "title": "Transcription failed",
+            "body": f"{type(e).__name__}: {e}\n\nYour audio is safe:\n" + wav,
+            "folder": audio_dir})
+
+    # a 200 with no words is a failure, not a success — don't write blank files
+    text = (result.get("text") or "").strip()
+    segs = result.get("segments") or []
+    if not text and not segs:
+        return ("result", {"ok": False, "title": "Empty transcript",
+            "body": "The server returned no words (silence, or wrong language?).\n"
+                    "Nothing was written.\n\nAudio:\n" + wav, "folder": audio_dir})
+
+    try:
+        label = ("_" + title.replace(" ", "-")) if title else ""
+        base = os.path.join(OUTPUT_DIR, f"{stamp_from_wav(wav)}{label}")
+        txt = write_outputs(result, base)
+    except Exception as e:
+        return ("result", {"ok": False, "title": "Could not write transcript",
+            "body": f"{type(e).__name__}: {e}"})
+
+    spk = result.get("num_speakers")
+    done = {"ok": True, "title": "Transcript ready",
+        "body": f"{os.path.basename(txt)}\n{len(segs)} segments · "
+                f"{spk} speaker(s) · {result.get('language')} · {result.get('duration')}s",
+        "folder": OUTPUT_DIR}
+    return ("name", {"txt": txt, "then": done, "title": title, "new": True})
+
+
 def main():
     ap = argparse.ArgumentParser(description="Record a meeting and transcribe via the TranscriptionSuite server.")
     ap.add_argument("--title", default="", help="label for the output filenames")
@@ -691,12 +1130,11 @@ def main():
     args = ap.parse_args()
 
     if args.server_up:
-        global _owned
         start_server()
-        _owned = False          # explicit "up" means leave it up after we exit
+        _disown()               # explicit "up" means leave it up after we exit
         return
     if args.server_down:
-        stop_server(); return
+        stop_server(explicit=True); return
 
     if args.list_devices:
         list_devices(); return

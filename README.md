@@ -255,7 +255,7 @@ set `MIC_NAME` to pin one (`--list-devices` shows them).
 - **Click again** to stop. The same title / speakers / diarization / language window
   and "who is who?" window as on Windows follow. The icon is amber while the server
   starts and transcribes.
-- **Right-click** (or Control-click) for the menu: *Transcribe an existing WAV…*,
+- **Right-click** (or Control-click) for the menu: *Transcribe an existing recording…*,
   *Name speakers in a transcript…*, *Open transcripts folder*, *Quit*.
 
 On a MacBook with a notch, a crowded menu bar can hide icons behind the notch;
@@ -270,9 +270,11 @@ The same `TRANSCRIPTION_*` variables as above, plus:
 | `TRANSCRIPTION_SERVER_MODE` | `auto` | `metal`, `docker`, or `auto` (metal when TranscriptionSuite's Metal backend is installed). |
 | `TRANSCRIPTION_SUITE_APP` | `/Applications/TranscriptionSuite.app` | Where TranscriptionSuite is installed. |
 
-Export them in your shell profile for terminal use. The login item gets a copy of the
-`TRANSCRIPTION_*` variables that are set when you run `macos/install.sh`, so re-run it
-after changing one.
+The easiest place for them is the `.env` file next to the scripts (see `.env.example`):
+it's read on every start, by the menu-bar app and the command line alike, so a change
+only needs an app restart. Variables exported in your shell also work; the login item
+gets a copy of the ones set when you run `macos/install.sh`, so re-run it after
+changing one of those.
 
 ### Logs and undo
 

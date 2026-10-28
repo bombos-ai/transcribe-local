@@ -1048,6 +1048,18 @@ def title_from_txt(txt_path):
     return "" if stem[:10].count("-") == 2 else stem
 
 
+def inbox_copy_line(txt_path, title=""):
+    """Write the inbox copy (if one is configured) for a tray; returns a line for
+    its result dialog, or None when there's nothing to say."""
+    if not INBOX_DIR:
+        return None
+    try:
+        path = write_inbox_copy(txt_path, title)
+    except Exception as e:
+        return f"⚠ Inbox copy failed: {type(e).__name__}: {e}"
+    return f"Inbox: {os.path.basename(path)}" if path else "Inbox: skipped (unreachable or no speakers)"
+
+
 # ------------------------------------------------------- tray job (both trays)
 def stamp_from_wav(wav):
     """Use the WAV's own filename (which is a recording timestamp) as the base

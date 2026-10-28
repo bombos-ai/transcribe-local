@@ -283,18 +283,6 @@ def transcribe_worker(wav, title, speakers, diar, lang):
 
 
 # ---------------------------------------------------------------- speaker names
-def _inbox_copy(txt, title):
-    """Write the inbox copy (if one is configured); returns a line for the result
-    dialog, or None when there's nothing to say."""
-    if not mr.INBOX_DIR:
-        return None
-    try:
-        path = mr.write_inbox_copy(txt, title)
-    except Exception as e:
-        return f"⚠ Inbox copy failed: {type(e).__name__}: {e}"
-    return f"Inbox: {os.path.basename(path)}" if path else "Inbox: skipped (unreachable or no speakers)"
-
-
 def show_name_dialog(txt, then=None, title="", new=False):
     """Show sample context for every speaker plus a name box each; on Save,
     replace the [speaker N] labels in the .txt. `then` is a result payload to
@@ -302,7 +290,7 @@ def show_name_dialog(txt, then=None, title="", new=False):
     after Save — and after Skip too for a `new` transcript, so every meeting
     lands in the inbox once."""
     def finish(saved):
-        line = _inbox_copy(txt, title) if (saved or new) else None
+        line = mr.inbox_copy_line(txt, title) if (saved or new) else None
         if then:
             body = then["body"] + (f"\n{line}" if line else "")
             show_result(then["ok"] and not (line or "").startswith("⚠"),

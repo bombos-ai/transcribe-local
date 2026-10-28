@@ -61,7 +61,7 @@ import meeting_recorder as mr
 
 # ---------------------------------------------------------------- shared state
 state = {"recording": False, "stop_event": None, "rec_thread": None,
-         "wav": None, "started": 0.0, "busy": False, "status": ""}
+         "wav": None, "started": 0.0, "busy": 0, "status": ""}   # busy = transcriptions running
 lock = threading.Lock()
 status_item = None
 controller = None
@@ -410,14 +410,14 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
         d.close()
         threading.Thread(target=transcribe_worker,
                          args=(wav, title, speakers, diarize, language), daemon=True).start()
-        notify("Transcribing…", "Starting the transcription server, then sending the audio.")
+        notify("Transcribing…", "Starting the server if needed, then transcribing.")
 
     def later():
         d.close()
         show_result(True, "Saved for later",
                     f"Audio kept:\n{wav}\n\nRight-click the menu-bar icon → "
-                    "“Transcribe an existing WAV…” when you want the transcript.",
-                    folder=mr.AUDIO_DIR)
+                    "“Transcribe an existing recording…” when you want the transcript.",
+                    folder=os.path.dirname(wav))
 
     d.on_close = later
     row = _buttons_row(d.button("Transcribe later", later), d.button("Transcribe", submit, "\r"))
@@ -432,17 +432,21 @@ def transcribe_worker(wav, title, speakers, diar, lang):
         state["status"] = msg
         refresh_icon()
 
-    state["busy"] = True
+    with lock:
+        state["busy"] += 1
     refresh_icon()
     try:
         kind, payload = mr.transcription_job(wav, title, speakers, diar, lang, progress)
         if kind == "name":
-            ui(show_name_dialog, payload["txt"], payload.get("then"))
+            ui(show_name_dialog, payload["txt"], payload.get("then"),
+               payload.get("title", ""), payload.get("new", False))
         else:
             ui(show_result, payload["ok"], payload["title"], payload["body"], payload.get("folder"))
     finally:
-        state["busy"] = False
-        state["status"] = ""
+        with lock:
+            state["busy"] -= 1
+            if not state["busy"]:
+                state["status"] = ""
         refresh_icon()
 
 
@@ -453,19 +457,28 @@ def _palette():
             NSColor.systemPinkColor(), NSColor.systemGrayColor()]
 
 
-def show_name_dialog(txt, then=None):
+def show_name_dialog(txt, then=None, title="", new=False):
     """Show the transcript with every speaker coloured plus a name box each; on
     Save, replace the [speaker N] labels in the .txt. `then` is a result payload
-    to show once this window closes."""
-    def finish():
+    to show once this window closes. The inbox copy (if configured) is written
+    after Save — and after Skip too for a `new` transcript, so every meeting
+    lands in the inbox once."""
+    def finish(saved):
+        line = mr.inbox_copy_line(txt, title) if (saved or new) else None
         if then:
-            show_result(then["ok"], then["title"], then["body"], then.get("folder"))
+            body = then["body"] + (f"\n{line}" if line else "")
+            show_result(then["ok"] and not (line or "").startswith("⚠"),
+                        then["title"], body, then.get("folder"))
+        elif saved:
+            show_result(not (line or "").startswith("⚠"), "Speakers renamed",
+                        os.path.basename(txt) + (f"\n{line}" if line else ""),
+                        folder=os.path.dirname(txt))
 
     turns = mr.read_turns(txt)
     speakers = sorted(dict.fromkeys(s for s, _ in turns),
                       key=lambda s: (len(s), s))   # speaker 2 before speaker 10
     if not speakers:
-        finish(); return
+        finish(False); return
 
     d = Dialog("Who is who?", resizable=True)
     palette = _palette()
@@ -543,11 +556,11 @@ def show_name_dialog(txt, then=None):
         except Exception as e:
             show_result(False, "Could not rename speakers", f"{type(e).__name__}: {e}\n\n{txt}")
             return
-        finish()
+        finish(True)
 
     def skip():
         d.close()
-        finish()
+        finish(False)
 
     d.on_close = skip
     row = _buttons_row(d.button("Skip", skip), d.button("Save names", save, "\r"))
@@ -562,14 +575,17 @@ def show_name_dialog(txt, then=None):
 
 
 # ---------------------------------------------------------------- file pickers
-def _pick(title, directory, ext):
+AUDIO_TYPES = ["wav", "mp3", "m4a", "ogg", "opus", "flac", "webm", "aac"]
+
+
+def _pick(title, directory, exts):
     panel = NSOpenPanel.openPanel()
     panel.setTitle_(title)
     panel.setMessage_(title)
     panel.setCanChooseFiles_(True)
     panel.setCanChooseDirectories_(False)
     panel.setAllowsMultipleSelection_(False)
-    panel.setAllowedFileTypes_([ext])
+    panel.setAllowedFileTypes_(exts)
     if directory and os.path.isdir(directory):
         panel.setDirectoryURL_(NSURL.fileURLWithPath_(directory))
     _activate()
@@ -580,20 +596,20 @@ def _pick(title, directory, ext):
 
 
 def pick_and_transcribe():
-    path = _pick("Pick a WAV to transcribe", mr.AUDIO_DIR, "wav")
+    path = _pick("Pick a recording to transcribe", mr.AUDIO_DIR, AUDIO_TYPES)
     print(f"pick: {path!r}")
     if path:
         show_transcribe_dialog(os.path.normpath(path))
 
 
 def pick_transcript_to_name():
-    path = _pick("Pick a transcript to name speakers in", mr.OUTPUT_DIR, "txt")
+    path = _pick("Pick a transcript to name speakers in", mr.OUTPUT_DIR, ["txt"])
     if path:
         path = os.path.normpath(path)
         if not mr.read_turns(path):
             show_result(False, "No speaker labels", f"No [speaker] lines found in:\n{path}")
         else:
-            show_name_dialog(path)
+            show_name_dialog(path, title=mr.title_from_txt(path))
 
 
 # ---------------------------------------------------------------- menu
@@ -641,7 +657,7 @@ class Controller(NSObject):
         status.setEnabled_(False)
         menu.addItem_(NSMenuItem.separatorItem())
         for title, sel in (("Stop recording" if state["recording"] else "Start recording", "toggle:"),
-                           ("Transcribe an existing WAV…", "pickWav:"),
+                           ("Transcribe an existing recording…", "pickWav:"),
                            ("Name speakers in a transcript…", "pickTxt:"),
                            ("Open transcripts folder", "openFolder:"),
                            (None, None),

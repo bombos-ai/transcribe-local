@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 meeting_tray.py — a system-tray button for meeting_recorder.py.
 
@@ -8,7 +8,7 @@ audio is sent to the TranscriptionSuite server and the diarized transcript is
 written to the output folder (see meeting_recorder.OUTPUT_DIR) — no terminal,
 no typing python commands.
 
-The icon is grey when idle and red while recording.
+The icon is grey when idle, red while recording and amber while transcribing.
 
 Run it with pythonw.exe so there's no console window:
     pythonw meeting_tray.py
@@ -51,7 +51,7 @@ import meeting_recorder as mr
 
 # ---------------------------------------------------------------- shared state
 state = {"recording": False, "stop_event": None, "rec_thread": None,
-         "wav": None, "started": 0.0, "busy": False, "status": ""}
+         "wav": None, "started": 0.0, "busy": 0, "status": ""}   # busy = transcriptions running
 lock = threading.Lock()
 ui_q = queue.Queue()          # tray thread -> tk main thread requests
 icon = None
@@ -193,10 +193,10 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
     win.attributes("-topmost", True)
     pad = {"padx": 12, "pady": 6}
 
-    dur = ""
+    heading = "Transcribe existing recording"
     if secs is not None:
-        dur = f"  ({int(secs) // 60}m {int(secs) % 60}s)"
-    ttk.Label(win, text=f"Recording saved{dur}", font=("Segoe UI", 10, "bold")).grid(
+        heading = f"Recording saved  ({int(secs) // 60}m {int(secs) % 60}s)"
+    ttk.Label(win, text=heading, font=("Segoe UI", 10, "bold")).grid(
         row=0, column=0, columnspan=2, sticky="w", **pad)
     head = ttk.Frame(win)
     head.grid(row=1, column=0, columnspan=2, sticky="w", padx=12)
@@ -242,14 +242,14 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
         win.destroy()
         threading.Thread(target=transcribe_worker,
                          args=(wav, title, speakers, diar, lang), daemon=True).start()
-        notify("Transcribing…", "Starting the transcription server, then sending the audio.")
+        notify("Transcribing…", "Starting the server if needed (a minute or two), then transcribing.")
 
     def later():
         win.destroy()
         show_result(True, "Saved for later",
                     f"Audio kept:\n{wav}\n\nRight-click the tray icon → "
-                    "“Transcribe an existing WAV…” when you want the transcript.",
-                    folder=mr.AUDIO_DIR)
+                    "“Transcribe an existing recording…” when you want the transcript.",
+                    folder=os.path.dirname(wav))
 
     ttk.Button(btns, text="Transcribe later", command=later).pack(side="left", padx=4)
     ttk.Button(btns, text="Transcribe", command=submit).pack(side="left", padx=4)
@@ -267,46 +267,42 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
 
 
 def transcribe_worker(wav, title, speakers, diar, lang):
-    # The server stack only exists for the length of this function: started here,
-    # torn down in the context manager's finally — including on every failure path
-    # below, which is why they all live inside the `with`.
+    # transcribe_file owns the server for exactly its own duration: it starts the
+    # stack if needed and takes it down again on every exit path, including the
+    # failures classified below (unless it was already running before we got here).
     def progress(msg):
         print(msg)
         state["status"] = msg
         refresh_icon()
 
-    state["busy"] = True
+    audio_dir = os.path.dirname(wav)
+    with lock:
+        state["busy"] += 1
     refresh_icon()
     try:
-        # 1) bring the server up, then call it, classifying the common failure modes.
-        #    The `with` stops the stack again on every exit path below — including
-        #    the early returns — unless it was already running before we got here.
+        # 1) bring the server up, then call it, classifying the common failure modes
         try:
-            with mr.transcription_server(progress):
-                try:
-                    progress("Transcribing…")
-                    result = mr.transcribe_file(wav, language=lang, diarization=diar,
-                                                expected_speakers=speakers)
-                except requests.exceptions.ConnectionError:
-                    ui_q.put(("result", {"ok": False, "title": "Server unreachable",
-                        "body": "The server came up but then dropped the connection on :9786.\n\n"
-                                "Your audio is safe — retry via\n"
-                                "the tray menu → “Transcribe an existing WAV…”:\n" + wav,
-                        "folder": mr.AUDIO_DIR})); return
-                except (requests.exceptions.ReadTimeout, TimeoutError):
-                    ui_q.put(("result", {"ok": False, "title": "Transcription timed out",
-                        "body": "The server didn't finish in time.\n\nYour audio is safe:\n" + wav,
-                        "folder": mr.AUDIO_DIR})); return
-                except Exception as e:
-                    ui_q.put(("result", {"ok": False, "title": "Transcription failed",
-                        "body": f"{type(e).__name__}: {e}\n\nYour audio is safe:\n" + wav,
-                        "folder": mr.AUDIO_DIR})); return
-        except Exception as e:
-            # only reachable from the bring-up itself; teardown failures are swallowed
+            result = mr.transcribe_file(wav, language=lang, diarization=diar,
+                                        expected_speakers=speakers, progress=progress)
+        except mr.ServerStartError as e:
             ui_q.put(("result", {"ok": False, "title": "Server didn't start",
-                "body": f"{type(e).__name__}: {e}\n\nYour audio is safe — retry via\n"
-                        "the tray menu → “Transcribe an existing WAV…”:\n" + wav,
-                "folder": mr.AUDIO_DIR})); return
+                "body": f"{e}\n\nYour audio is safe — retry via\n"
+                        "the tray menu → “Transcribe an existing recording…”:\n" + wav,
+                "folder": audio_dir})); return
+        except requests.exceptions.ConnectionError:
+            ui_q.put(("result", {"ok": False, "title": "Server unreachable",
+                "body": "Lost the connection to the transcription server on :9786\n"
+                        "(did it crash or run out of memory?).\n\nYour audio is safe — retry via\n"
+                        "the tray menu → “Transcribe an existing recording…”:\n" + wav,
+                "folder": audio_dir})); return
+        except (requests.exceptions.ReadTimeout, TimeoutError):
+            ui_q.put(("result", {"ok": False, "title": "Transcription timed out",
+                "body": "The server didn't finish in time.\n\nYour audio is safe:\n" + wav,
+                "folder": audio_dir})); return
+        except Exception as e:
+            ui_q.put(("result", {"ok": False, "title": "Transcription failed",
+                "body": f"{type(e).__name__}: {e}\n\nYour audio is safe:\n" + wav,
+                "folder": audio_dir})); return
 
         # 2) a 200 with no words is a failure, not a success — don't write blank files
         text = (result.get("text") or "").strip()
@@ -314,7 +310,7 @@ def transcribe_worker(wav, title, speakers, diar, lang):
         if not text and not segs:
             ui_q.put(("result", {"ok": False, "title": "Empty transcript",
                 "body": "The server returned no words (silence, or wrong language?).\n"
-                        "Nothing was written.\n\nAudio:\n" + wav, "folder": mr.AUDIO_DIR})); return
+                        "Nothing was written.\n\nAudio:\n" + wav, "folder": audio_dir})); return
 
         # 3) write the files
         try:
@@ -330,27 +326,50 @@ def transcribe_worker(wav, title, speakers, diar, lang):
             "body": f"{os.path.basename(txt)}\n{len(segs)} segments · "
                     f"{spk} speaker(s) · {result.get('language')} · {result.get('duration')}s",
             "folder": mr.OUTPUT_DIR}
-        ui_q.put(("name", {"txt": txt, "then": done}))
+        ui_q.put(("name", {"txt": txt, "then": done, "title": title, "new": True}))
     finally:
-        state["busy"] = False
-        state["status"] = ""
+        with lock:
+            state["busy"] -= 1
+            if not state["busy"]:
+                state["status"] = ""
         refresh_icon()
 
 
 # ---------------------------------------------------------------- speaker names
-def show_name_dialog(txt, then=None):
+def _inbox_copy(txt, title):
+    """Write the inbox copy (if one is configured); returns a line for the result
+    dialog, or None when there's nothing to say."""
+    if not mr.INBOX_DIR:
+        return None
+    try:
+        path = mr.write_inbox_copy(txt, title)
+    except Exception as e:
+        return f"⚠ Inbox copy failed: {type(e).__name__}: {e}"
+    return f"Inbox: {os.path.basename(path)}" if path else "Inbox: skipped (unreachable or no speakers)"
+
+
+def show_name_dialog(txt, then=None, title="", new=False):
     """Show sample context for every speaker plus a name box each; on Save,
     replace the [speaker N] labels in the .txt. `then` is a result payload to
-    show once this dialog closes."""
-    def finish():
+    show once this dialog closes. The inbox copy (if configured) is written
+    after Save — and after Skip too for a `new` transcript, so every meeting
+    lands in the inbox once."""
+    def finish(saved):
+        line = _inbox_copy(txt, title) if (saved or new) else None
         if then:
-            show_result(then["ok"], then["title"], then["body"], then.get("folder"))
+            body = then["body"] + (f"\n{line}" if line else "")
+            show_result(then["ok"] and not (line or "").startswith("⚠"),
+                        then["title"], body, then.get("folder"))
+        elif saved:
+            show_result(not (line or "").startswith("⚠"), "Speakers renamed",
+                        os.path.basename(txt) + (f"\n{line}" if line else ""),
+                        folder=os.path.dirname(txt))
 
     turns = mr.read_turns(txt)
     speakers = sorted(dict.fromkeys(s for s, _ in turns),
                       key=lambda s: (len(s), s))   # speaker 2 before speaker 10
     if not speakers:
-        finish(); return
+        finish(False); return
 
     win = tk.Toplevel(root)
     win.title("Who is who?")
@@ -436,11 +455,11 @@ def show_name_dialog(txt, then=None):
         except Exception as e:
             show_result(False, "Could not rename speakers", f"{type(e).__name__}: {e}\n\n{txt}")
             return
-        finish()
+        finish(True)
 
     def skip():
         win.destroy()
-        finish()
+        finish(False)
 
     btns = ttk.Frame(win)
     btns.grid(row=5, column=0, columnspan=2, sticky="e", padx=12, pady=(8, 12))
@@ -473,7 +492,7 @@ def pick_transcript_to_name():
         if not mr.read_turns(path):
             show_result(False, "No speaker labels", f"No [speaker] lines found in:\n{path}")
         else:
-            show_name_dialog(path)
+            show_name_dialog(path, title=mr.title_from_txt(path))
 
 
 # ---------------------------------------------------------------- tray menu
@@ -506,7 +525,7 @@ def build_menu():
         pystray.MenuItem(
             lambda item: "■  Stop recording" if state["recording"] else "●  Start recording",
             on_toggle, default=True),
-        pystray.MenuItem("Transcribe an existing WAV…", on_pick_file),
+        pystray.MenuItem("Transcribe an existing recording…", on_pick_file),
         pystray.MenuItem("Name speakers in a transcript…", on_name_file),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
@@ -575,7 +594,8 @@ def pump():
                 elif kind == "pick":
                     pick_and_transcribe()
                 elif kind == "name":
-                    show_name_dialog(payload["txt"], payload.get("then"))
+                    show_name_dialog(payload["txt"], payload.get("then"),
+                                     payload.get("title", ""), payload.get("new", False))
                 elif kind == "pick_names":
                     pick_transcript_to_name()
             except Exception as e:
@@ -599,9 +619,10 @@ def pick_and_transcribe():
     try:
         path = filedialog.askopenfilename(
             parent=parent,
-            title="Pick a WAV to transcribe",
+            title="Pick a recording to transcribe",
             initialdir=mr.AUDIO_DIR if os.path.isdir(mr.AUDIO_DIR) else None,
-            filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")])
+            filetypes=[("Audio", "*.wav *.mp3 *.m4a *.ogg *.opus *.flac *.webm *.aac"),
+                       ("All files", "*.*")])
     finally:
         parent.destroy()
     print(f"pick: {path!r}")

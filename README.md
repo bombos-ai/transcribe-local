@@ -4,8 +4,10 @@ Record a meeting on your own PC and get a speaker-labelled transcript back, with
 anything leaving the machine.
 
 - Captures **your microphone and the system output** (the other people on the call)
-  at the same time, mixed into one 16 kHz mono WAV.
+  at the same time, as a 16 kHz stereo WAV (left = mic, right = system).
 - Saves the WAV **first**, so the audio survives whatever goes wrong afterwards.
+- Levels both sides automatically before transcribing, so a quiet laptop mic isn't
+  drowned out by loud call audio, and overlapping speech stays audible.
 - Sends it to a local [TranscriptionSuite](https://github.com/homelab-00/TranscriptionSuite)
   server (Whisper + diarization in Docker) and writes a `.txt` with one line per
   speaker turn: `[speaker 0] …`, `[speaker 1] …`.
@@ -13,6 +15,8 @@ anything leaving the machine.
   holding your GPU and several GB of RAM between meetings.
 - A **system-tray button** to start/stop, a popup for title and speaker count, and a
   "who is who?" dialog to replace `speaker N` with real names.
+- Optionally drops a clean Markdown copy of each diarized transcript into a second
+  folder, such as a notes app's or knowledge base's inbox.
 
 Windows only: audio capture uses WASAPI loopback, and the tray and watchdog use Win32.
 
@@ -20,7 +24,9 @@ Windows only: audio capture uses WASAPI loopback, and the tray and watchdog use 
 
 - Windows 10 or 11
 - Python 3 from [python.org](https://www.python.org/downloads/windows/) (includes
-  `tkinter`; developed on 3.13). Tick **Add python.exe to PATH** in the installer.
+  `tkinter`; developed on 3.13 and 3.14). Either tick **Add python.exe to PATH** in the
+  installer, or use the `py` / `pyw` launcher it always installs instead of
+  `python` / `pythonw` in the commands below.
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - An NVIDIA GPU is strongly recommended. TranscriptionSuite has a CPU profile, but
   long meetings get slow.
@@ -49,29 +55,32 @@ This tool doesn't ship its own model server; it drives the TranscriptionSuite on
    Docker Compose project this tool starts and stops.
 5. Close the dashboard. From here on the recorder starts the server itself.
 
+Running TranscriptionSuite from a manual checkout instead of the dashboard also works:
+point `TRANSCRIPTION_COMPOSE_DIR` at its `docker` folder, and if that folder's `.env`
+doesn't set `COMPOSE_FILE`, list the compose files in `TRANSCRIPTION_COMPOSE_FILES`.
+Put your Hugging Face token in `HF_TOKEN`; it is passed to the server on start.
+
 The server listens on `http://localhost:9786`.
 
 ### 3. Configure
 
-Everything has a default; set environment variables only for what you want to change.
+Everything has a default. To change something, copy `.env.example` to `.env` next to
+the scripts and fill in what you need (environment variables work too, and win over
+`.env`). Restart the tray after editing.
 
 | Variable | Default | What it does |
 |---|---|---|
 | `TRANSCRIPTION_OUTPUT_DIR` | `%USERPROFILE%\Transcriptions` | Where transcripts go. WAVs go in its `recordings\` subfolder. |
+| `TRANSCRIPTION_INBOX_DIR` | *(off)* | Also write each diarized transcript here as `YYYY-MM-DD-transcript-<title>.md`. Never overwrites. |
 | `TRANSCRIPTION_LANGUAGE` | `nl` | Language code sent to the server. The tray popup lets you change it per recording. |
-| `TRANSCRIPTION_COMPOSE_DIR` | `%APPDATA%\TranscriptionSuite\docker` | TranscriptionSuite's Compose folder. |
-
-```powershell
-setx TRANSCRIPTION_OUTPUT_DIR "D:\Transcriptions"
-setx TRANSCRIPTION_LANGUAGE "en"
-```
-
-`setx` only affects programs started afterwards, so open a new terminal (and restart the
-tray if it's running).
+| `TRANSCRIPTION_COMPOSE_DIR` | `%APPDATA%\TranscriptionSuite\docker`, else `%USERPROFILE%\TranscriptionSuite\docker` | TranscriptionSuite's Compose folder. |
+| `TRANSCRIPTION_COMPOSE_FILES` | *(let the folder's `.env` decide)* | `;`-separated compose files to pass as `-f`, for a checkout whose `.env` doesn't pin `COMPOSE_FILE`. |
+| `HF_TOKEN` | *(none)* | Hugging Face token handed to the server as `HUGGINGFACE_TOKEN` (diarization needs it). |
 
 Two more settings live at the top of `meeting_recorder.py`:
 `MIC_NAME` (pick a specific mic by part of its name; default is the Windows default
-input) and `MIC_GAIN` (also available as `--mic-gain`).
+input) and `MIC_GAIN` (an extra multiplier on top of the automatic levelling; also
+available as `--mic-gain`).
 
 ### 4. Check that both sides are captured
 
@@ -103,14 +112,17 @@ pythonw meeting_tray.py
   (0 = let the model decide), diarization on/off and the language.
 - The icon turns amber while the server starts (first cold start: ~60–90 s) and the
   audio is transcribed. Then a "who is who?" dialog shows the transcript with a name
-  box per speaker; leave a box empty to keep `speaker N`.
+  box per speaker; leave a box empty to keep `speaker N`. Closing it (Save or Skip)
+  writes the inbox copy, if one is configured.
 - **Transcribe later** keeps the WAV and skips the server.
 
 Right-click menu:
 
-- **Transcribe an existing WAV…** re-runs any saved recording. This is also the
-  recovery path when a transcription fails: the audio is always kept.
+- **Transcribe an existing recording…** re-runs any saved WAV, or transcribes an
+  MP3/M4A/OGG/FLAC from elsewhere. This is also the recovery path when a transcription
+  fails: the audio is always kept.
 - **Name speakers in a transcript…** opens the naming dialog for an older `.txt`.
+  Saving writes a fresh inbox copy (`-2`, `-3`, …).
 - **Quit**
 
 Only one tray instance can run; launching it again does nothing. It logs to `tray.log`
@@ -126,11 +138,11 @@ Press **Enter** to stop recording. Other options:
 
 | Option | What it does |
 |---|---|
-| `--file some.wav` | Transcribe an existing WAV instead of recording. |
+| `--file some.wav` | Transcribe an existing recording (WAV, MP3, …) instead of recording. |
 | `--speakers N` | Hint for diarization. |
 | `--no-diarization` | Plain transcript, no speaker labels. |
 | `--language xx` | Override the language for this run. |
-| `--mic-gain N` | Boost your own voice in the mix (default 3; headset mics run quiet). Lower it if your lines clip. |
+| `--mic-gain N` | Extra multiplier for your own voice on top of the automatic levelling (default 1). |
 | `--list-devices` | Show microphones and loopback devices. |
 | `--server-up` / `--server-down` | Start the server and leave it up / stop it. |
 | `--keep-server` | Start the server if needed and leave it running afterwards. |
@@ -146,7 +158,7 @@ Start the tray at login:
 $repo = (Get-Location).Path
 $lnk  = Join-Path ([Environment]::GetFolderPath('Startup')) 'Meeting Recorder.lnk'
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-$s.TargetPath = (Get-Command pythonw.exe).Source
+$s.TargetPath = (Get-Command pyw.exe).Source
 $s.Arguments = "`"$repo\meeting_tray.py`""
 $s.WorkingDirectory = $repo
 $s.Save()
@@ -164,8 +176,9 @@ Register-ScheduledTask -TaskName MeetingRecorderWatchdog `
   -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew)
 ```
 
-The watchdog finds `pythonw.exe` via `PATH`; if it isn't on `PATH`, set the full path in
-`PYTHONW` at the top of `watchdog.vbs`. It logs to `watchdog.log`.
+The watchdog launches the tray with `pyw.exe` (the Python launcher, always on `PATH`
+after a python.org install); to pin a specific interpreter, set a full `pythonw.exe`
+path in `PYTHONW` at the top of `watchdog.vbs`. It logs to `watchdog.log`.
 
 To undo: delete **Meeting Recorder** from `shell:startup` (Win+R → `shell:startup`) and
 run `Unregister-ScheduledTask -TaskName MeetingRecorderWatchdog`.
@@ -173,19 +186,29 @@ run `Unregister-ScheduledTask -TaskName MeetingRecorderWatchdog`.
 ## How the server is managed
 
 - Transcription runs `docker compose up -d` in the Compose folder, waits for `/health`,
-  transcribes, then runs `docker compose down`.
+  transcribes, then runs `docker compose down` in the background (the server drains
+  for up to ~2 minutes; the next start waits for that to finish).
 - If the server was **already running** (for example you opened the dashboard), it's
   used as-is and left running. Only a server this tool started gets stopped.
+- Several transcriptions can run at once from the tray; the server stays up until the
+  last one is done.
 - If the process dies mid-job, an exit hook still stops the server.
-- No `-f`/`-p` flags are passed; the dashboard's `.env` pins `COMPOSE_FILE` and
-  `COMPOSE_PROJECT_NAME`, so this tool and the dashboard always agree on the stack.
+- The PC is kept from sleeping while recording and while transcribing (the screen can
+  still lock), so standby can't stall a long job.
+- By default no `-f`/`-p` flags are passed; the dashboard's `.env` pins `COMPOSE_FILE`
+  and `COMPOSE_PROJECT_NAME`, so this tool and the dashboard always agree on the stack.
+  `TRANSCRIPTION_COMPOSE_FILES` overrides that for a manual checkout.
 
 ## Output
 
 In `TRANSCRIPTION_OUTPUT_DIR`:
 
-- `recordings\2026-10-28_1422.wav`: the audio, saved before transcription starts
+- `recordings\2026-10-28_1422.wav`: the raw audio (stereo: left = you, right = the
+  call), saved before transcription starts. It sounds unbalanced when played back;
+  levelling happens at transcription time, so it can always be re-run.
 - `2026-10-28_1422_Weekly-sync.txt`: one line per speaker turn
+
+With `TRANSCRIPTION_INBOX_DIR` set, also `2026-10-28-transcript-weekly-sync.md` there.
 
 ## Troubleshooting
 
@@ -193,11 +216,13 @@ In `TRANSCRIPTION_OUTPUT_DIR`:
   the Windows default; change it or set `MIC_NAME`.
 - **The other side is missing.** `system=` is ~0: the call is playing through a device
   that isn't the Windows default output.
+- **"Capture dropouts" warning.** Short gaps in the audio, usually because the machine
+  was overloaded (low on RAM) during the call.
 - **"Server didn't start".** Is Docker Desktop running? Does
   `TRANSCRIPTION_COMPOSE_DIR` point at a folder with a `.env`? Try
   `python meeting_recorder.py --server-up` in a terminal to see the error.
 - **Transcription failed or timed out.** The WAV is kept. Use **Transcribe an existing
-  WAV…** or `--file`.
+  recording…** or `--file`.
 - **Tray icon gone.** Check `tray.log`. With the watchdog installed it comes back within
   5 minutes.
 

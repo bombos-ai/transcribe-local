@@ -7,10 +7,12 @@
 ' whose last heartbeat says it was recording is never killed (that would lose the
 ' meeting), and neither is one with no heartbeat for its pid (an older build).
 '
-' PYTHONW is resolved via PATH; set it to a full path if pythonw.exe isn't on PATH.
+' PYTHONW defaults to pyw.exe, the Python launcher's windowless twin: the python.org
+' installer puts it on PATH even when python/pythonw themselves aren't. Set it to a
+' full pythonw.exe path to pin a specific interpreter.
 Option Explicit
 Const STALE_SECS = 180
-Const PYTHONW = "pythonw.exe"
+Const PYTHONW = "pyw.exe"
 Dim wmi, procs, p, proc, sh, fso, DIR_
 Set fso = CreateObject("Scripting.FileSystemObject")
 DIR_ = fso.GetParentFolderName(WScript.ScriptFullName)   ' lives next to meeting_tray.py

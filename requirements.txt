@@ -1,5 +1,8 @@
-soundcard>=0.4.6
 numpy
 requests
-pystray>=0.19
-pillow
+# Windows: audio capture (WASAPI loopback) and the system-tray icon
+soundcard>=0.4.6; sys_platform == "win32"
+pystray>=0.19; sys_platform == "win32"
+pillow; sys_platform == "win32"
+# macOS: the menu-bar app (audio capture is the Swift helper in macos/)
+pyobjc-framework-Cocoa>=10.3; sys_platform == "darwin"

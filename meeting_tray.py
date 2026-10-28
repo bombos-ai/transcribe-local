@@ -17,6 +17,12 @@ Deps: pip install soundcard numpy requests pystray pillow   (tkinter ships with 
 """
 import os, sys, time, threading, queue
 
+if sys.platform == "darwin":          # the macOS menu-bar app is its own module
+    import runpy
+    runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "meeting_tray_mac.py"),
+                   run_name="__main__")
+    sys.exit(0)
+
 # --- make this importable no matter where it's launched from, and give the
 #     (console-less) pythonw process somewhere for prints to go BEFORE we import
 #     meeting_recorder, which writes to sys.stdout at import time. ------------
@@ -44,8 +50,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import pystray
 from PIL import Image, ImageDraw
-import requests
-
 import meeting_recorder as mr
 
 
@@ -56,13 +60,6 @@ lock = threading.Lock()
 ui_q = queue.Queue()          # tray thread -> tk main thread requests
 icon = None
 root = None
-
-
-def _stamp_from_wav(wav):
-    """Use the WAV's own filename (which is a recording timestamp) as the base
-    for the transcript files, so text stays associated with its audio."""
-    base = os.path.splitext(os.path.basename(wav))[0]
-    return base or mr._ts()
 
 
 # ---------------------------------------------------------------- tray icon art
@@ -267,9 +264,6 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
 
 
 def transcribe_worker(wav, title, speakers, diar, lang):
-    # The server stack only exists for the length of this function: started here,
-    # torn down in the context manager's finally — including on every failure path
-    # below, which is why they all live inside the `with`.
     def progress(msg):
         print(msg)
         state["status"] = msg
@@ -278,59 +272,7 @@ def transcribe_worker(wav, title, speakers, diar, lang):
     state["busy"] = True
     refresh_icon()
     try:
-        # 1) bring the server up, then call it, classifying the common failure modes.
-        #    The `with` stops the stack again on every exit path below — including
-        #    the early returns — unless it was already running before we got here.
-        try:
-            with mr.transcription_server(progress):
-                try:
-                    progress("Transcribing…")
-                    result = mr.transcribe_file(wav, language=lang, diarization=diar,
-                                                expected_speakers=speakers)
-                except requests.exceptions.ConnectionError:
-                    ui_q.put(("result", {"ok": False, "title": "Server unreachable",
-                        "body": "The server came up but then dropped the connection on :9786.\n\n"
-                                "Your audio is safe — retry via\n"
-                                "the tray menu → “Transcribe an existing WAV…”:\n" + wav,
-                        "folder": mr.AUDIO_DIR})); return
-                except (requests.exceptions.ReadTimeout, TimeoutError):
-                    ui_q.put(("result", {"ok": False, "title": "Transcription timed out",
-                        "body": "The server didn't finish in time.\n\nYour audio is safe:\n" + wav,
-                        "folder": mr.AUDIO_DIR})); return
-                except Exception as e:
-                    ui_q.put(("result", {"ok": False, "title": "Transcription failed",
-                        "body": f"{type(e).__name__}: {e}\n\nYour audio is safe:\n" + wav,
-                        "folder": mr.AUDIO_DIR})); return
-        except Exception as e:
-            # only reachable from the bring-up itself; teardown failures are swallowed
-            ui_q.put(("result", {"ok": False, "title": "Server didn't start",
-                "body": f"{type(e).__name__}: {e}\n\nYour audio is safe — retry via\n"
-                        "the tray menu → “Transcribe an existing WAV…”:\n" + wav,
-                "folder": mr.AUDIO_DIR})); return
-
-        # 2) a 200 with no words is a failure, not a success — don't write blank files
-        text = (result.get("text") or "").strip()
-        segs = result.get("segments") or []
-        if not text and not segs:
-            ui_q.put(("result", {"ok": False, "title": "Empty transcript",
-                "body": "The server returned no words (silence, or wrong language?).\n"
-                        "Nothing was written.\n\nAudio:\n" + wav, "folder": mr.AUDIO_DIR})); return
-
-        # 3) write the files
-        try:
-            label = ("_" + title.replace(" ", "-")) if title else ""
-            base = os.path.join(mr.OUTPUT_DIR, f"{_stamp_from_wav(wav)}{label}")
-            txt = mr.write_outputs(result, base)
-        except Exception as e:
-            ui_q.put(("result", {"ok": False, "title": "Could not write transcript",
-                "body": f"{type(e).__name__}: {e}"})); return
-
-        spk = result.get("num_speakers")
-        done = {"ok": True, "title": "Transcript ready",
-            "body": f"{os.path.basename(txt)}\n{len(segs)} segments · "
-                    f"{spk} speaker(s) · {result.get('language')} · {result.get('duration')}s",
-            "folder": mr.OUTPUT_DIR}
-        ui_q.put(("name", {"txt": txt, "then": done}))
+        ui_q.put(mr.transcription_job(wav, title, speakers, diar, lang, progress))
     finally:
         state["busy"] = False
         state["status"] = ""

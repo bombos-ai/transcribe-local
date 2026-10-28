@@ -1,0 +1,5 @@
+soundcard>=0.4.6
+numpy
+requests
+pystray>=0.19
+pillow

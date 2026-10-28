@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# transcribe-local runtime files
+tray.heartbeat
+*.wav
+recordings/

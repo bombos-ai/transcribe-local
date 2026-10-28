@@ -17,6 +17,12 @@ Deps: pip install soundcard numpy requests pystray pillow   (tkinter ships with 
 """
 import os, sys, time, threading, queue
 
+if sys.platform == "darwin":          # the macOS menu-bar app is its own module
+    import runpy
+    runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "meeting_tray_mac.py"),
+                   run_name="__main__")
+    sys.exit(0)
+
 # --- make this importable no matter where it's launched from, and give the
 #     (console-less) pythonw process somewhere for prints to go BEFORE we import
 #     meeting_recorder, which writes to sys.stdout at import time. ------------
@@ -44,8 +50,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import pystray
 from PIL import Image, ImageDraw
-import requests
-
 import meeting_recorder as mr
 
 
@@ -56,13 +60,6 @@ lock = threading.Lock()
 ui_q = queue.Queue()          # tray thread -> tk main thread requests
 icon = None
 root = None
-
-
-def _stamp_from_wav(wav):
-    """Use the WAV's own filename (which is a recording timestamp) as the base
-    for the transcript files, so text stays associated with its audio."""
-    base = os.path.splitext(os.path.basename(wav))[0]
-    return base or mr._ts()
 
 
 # ---------------------------------------------------------------- tray icon art
@@ -267,66 +264,16 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
 
 
 def transcribe_worker(wav, title, speakers, diar, lang):
-    # transcribe_file owns the server for exactly its own duration: it starts the
-    # stack if needed and takes it down again on every exit path, including the
-    # failures classified below (unless it was already running before we got here).
     def progress(msg):
         print(msg)
         state["status"] = msg
         refresh_icon()
 
-    audio_dir = os.path.dirname(wav)
     with lock:
         state["busy"] += 1
     refresh_icon()
     try:
-        # 1) bring the server up, then call it, classifying the common failure modes
-        try:
-            result = mr.transcribe_file(wav, language=lang, diarization=diar,
-                                        expected_speakers=speakers, progress=progress)
-        except mr.ServerStartError as e:
-            ui_q.put(("result", {"ok": False, "title": "Server didn't start",
-                "body": f"{e}\n\nYour audio is safe — retry via\n"
-                        "the tray menu → “Transcribe an existing recording…”:\n" + wav,
-                "folder": audio_dir})); return
-        except requests.exceptions.ConnectionError:
-            ui_q.put(("result", {"ok": False, "title": "Server unreachable",
-                "body": "Lost the connection to the transcription server on :9786\n"
-                        "(did it crash or run out of memory?).\n\nYour audio is safe — retry via\n"
-                        "the tray menu → “Transcribe an existing recording…”:\n" + wav,
-                "folder": audio_dir})); return
-        except (requests.exceptions.ReadTimeout, TimeoutError):
-            ui_q.put(("result", {"ok": False, "title": "Transcription timed out",
-                "body": "The server didn't finish in time.\n\nYour audio is safe:\n" + wav,
-                "folder": audio_dir})); return
-        except Exception as e:
-            ui_q.put(("result", {"ok": False, "title": "Transcription failed",
-                "body": f"{type(e).__name__}: {e}\n\nYour audio is safe:\n" + wav,
-                "folder": audio_dir})); return
-
-        # 2) a 200 with no words is a failure, not a success — don't write blank files
-        text = (result.get("text") or "").strip()
-        segs = result.get("segments") or []
-        if not text and not segs:
-            ui_q.put(("result", {"ok": False, "title": "Empty transcript",
-                "body": "The server returned no words (silence, or wrong language?).\n"
-                        "Nothing was written.\n\nAudio:\n" + wav, "folder": audio_dir})); return
-
-        # 3) write the files
-        try:
-            label = ("_" + title.replace(" ", "-")) if title else ""
-            base = os.path.join(mr.OUTPUT_DIR, f"{_stamp_from_wav(wav)}{label}")
-            txt = mr.write_outputs(result, base)
-        except Exception as e:
-            ui_q.put(("result", {"ok": False, "title": "Could not write transcript",
-                "body": f"{type(e).__name__}: {e}"})); return
-
-        spk = result.get("num_speakers")
-        done = {"ok": True, "title": "Transcript ready",
-            "body": f"{os.path.basename(txt)}\n{len(segs)} segments · "
-                    f"{spk} speaker(s) · {result.get('language')} · {result.get('duration')}s",
-            "folder": mr.OUTPUT_DIR}
-        ui_q.put(("name", {"txt": txt, "then": done, "title": title, "new": True}))
+        ui_q.put(mr.transcription_job(wav, title, speakers, diar, lang, progress))
     finally:
         with lock:
             state["busy"] -= 1
@@ -336,18 +283,6 @@ def transcribe_worker(wav, title, speakers, diar, lang):
 
 
 # ---------------------------------------------------------------- speaker names
-def _inbox_copy(txt, title):
-    """Write the inbox copy (if one is configured); returns a line for the result
-    dialog, or None when there's nothing to say."""
-    if not mr.INBOX_DIR:
-        return None
-    try:
-        path = mr.write_inbox_copy(txt, title)
-    except Exception as e:
-        return f"⚠ Inbox copy failed: {type(e).__name__}: {e}"
-    return f"Inbox: {os.path.basename(path)}" if path else "Inbox: skipped (unreachable or no speakers)"
-
-
 def show_name_dialog(txt, then=None, title="", new=False):
     """Show sample context for every speaker plus a name box each; on Save,
     replace the [speaker N] labels in the .txt. `then` is a result payload to
@@ -355,7 +290,7 @@ def show_name_dialog(txt, then=None, title="", new=False):
     after Save — and after Skip too for a `new` transcript, so every meeting
     lands in the inbox once."""
     def finish(saved):
-        line = _inbox_copy(txt, title) if (saved or new) else None
+        line = mr.inbox_copy_line(txt, title) if (saved or new) else None
         if then:
             body = then["body"] + (f"\n{line}" if line else "")
             show_result(then["ok"] and not (line or "").startswith("⚠"),

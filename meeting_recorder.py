@@ -1112,7 +1112,11 @@ def _disown():
 
 def _stop_if_owned():
     """Last line of defence: if the process exits mid-transcription (tray Quit,
-    Ctrl-C), don't leave the server — and the GPU — occupied."""
+    Ctrl-C), don't leave the server — and the GPU — occupied. A background Metal
+    teardown is a daemon thread that dies with us, so finish it first (a
+    background `compose down` is a process of its own and carries on alone)."""
+    if isinstance(_stopping, threading.Thread):
+        _wait_for_stop()
     if _owned:
         with contextlib.suppress(Exception):
             stop_server()

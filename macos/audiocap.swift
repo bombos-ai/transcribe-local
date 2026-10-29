@@ -232,7 +232,8 @@ final class SystemCapture {
     var tapID = AudioObjectID(kAudioObjectUnknown)
     var aggID = AudioObjectID(kAudioObjectUnknown)
     var procID: AudioDeviceIOProcID?
-    var tapFormat: AVAudioFormat!
+    var tapASBD = AudioStreamBasicDescription()
+    var format: AVAudioFormat!         // what buffers really arrive as (see deviceFormat); ioQueue only
     var callbacks = 0                  // touched on ioQueue / the IO thread only as a liveness hint
     var style = 0                      // which aggregate recipe worked (see build)
 
@@ -263,7 +264,7 @@ final class SystemCapture {
                 style = attempt
                 writer.resetConverter()
                 log("system: tapping all output via \(deviceName(defaultDevice(input: false))) " +
-                    "(\(Int(tapFormat.sampleRate)) Hz, \(tapFormat.channelCount) ch, recipe \(attempt))")
+                    "(\(Int(format.sampleRate)) Hz, \(format.channelCount) ch, recipe \(attempt))")
                 return
             }
             log("system: recipe \(attempt) delivered no audio; trying the other one")
@@ -282,10 +283,21 @@ final class SystemCapture {
         desc.muteBehavior = .unmuted
         var err = AudioHardwareCreateProcessTap(desc, &tapID)
         guard err == noErr else { die("AudioHardwareCreateProcessTap failed (\(err))") }
-        var asbd = AudioStreamBasicDescription()
-        err = getProp(tapID, kAudioTapPropertyFormat, &asbd)
-        guard err == noErr, let fmt = AVAudioFormat(streamDescription: &asbd) else { die("cannot read tap format (\(err))") }
-        tapFormat = fmt
+        err = getProp(tapID, kAudioTapPropertyFormat, &tapASBD)
+        guard err == noErr, AVAudioFormat(streamDescription: &tapASBD) != nil else { die("cannot read tap format (\(err))") }
+    }
+
+    /// The tap's channel layout at the rate the aggregate actually runs at. That's
+    /// its main sub-device's rate, not the tap's: AirPods in a call run at 24 kHz
+    /// while the tap still says 48 kHz, and taking the tap's word for it made the
+    /// other side come out twice as fast with every other second padded silence.
+    func deviceFormat() -> AVAudioFormat {
+        var asbd = tapASBD
+        var rate = Float64(0)
+        if getProp(aggID, kAudioDevicePropertyNominalSampleRate, &rate) == noErr, rate > 0 {
+            asbd.mSampleRate = rate
+        }
+        return AVAudioFormat(streamDescription: &asbd)!
     }
 
     func createAggregate(style: Int) {
@@ -323,11 +335,23 @@ final class SystemCapture {
 
     func startIO() {
         callbacks = 0
-        let format = tapFormat!
+        format = deviceFormat()
         let writer = self.writer
+        var lastCheck = DispatchTime.now()
         var err = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, ioQueue) { [weak self] _, inData, _, _, _ in
-            self?.callbacks += 1
-            if let copy = copyBuffer(inData, format: format) {
+            guard let self = self else { return }
+            self.callbacks += 1
+            // The rate changes under us when a headset enters or leaves call mode.
+            let now = DispatchTime.now()
+            if now.uptimeNanoseconds - lastCheck.uptimeNanoseconds > 250_000_000 {
+                lastCheck = now
+                let fmt = self.deviceFormat()
+                if fmt.sampleRate != self.format.sampleRate {
+                    log("system: device rate changed \(Int(self.format.sampleRate)) -> \(Int(fmt.sampleRate)) Hz")
+                    self.format = fmt
+                }
+            }
+            if let copy = copyBuffer(inData, format: self.format) {
                 writer.queue.async { writer.push(copy) }
             }
         }

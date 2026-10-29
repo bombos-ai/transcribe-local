@@ -86,9 +86,9 @@ the scripts and fill in what you need (environment variables work too, and win o
 | `HF_TOKEN` | *(none)* | Hugging Face token handed to the server as `HUGGINGFACE_TOKEN` (diarization needs it). |
 
 Two more settings live at the top of `meeting_recorder.py`:
-`MIC_NAME` (pick a specific mic by part of its name; default is the Windows default
-input) and `MIC_GAIN` (an extra multiplier on top of the automatic levelling; also
-available as `--mic-gain`).
+`MIC_NAME` (pin a specific mic by part of its name; by default the mic your meeting
+app is using, else the default input) and `MIC_GAIN` (an extra multiplier on top of
+the automatic levelling; also available as `--mic-gain`).
 
 ### 4. Check that both sides are captured
 
@@ -98,14 +98,26 @@ Do this before relying on it for a real meeting. Play some audio and talk:
 python meeting_recorder.py --selftest
 ```
 
-It records 5 seconds and prints peak levels:
+It records 5 seconds (`--selftest 30` for longer) and prints peak levels:
 
 - `mic=…` must be above 0 while you speak: your own voice is captured.
 - `system=…` must be above 0 while audio plays: the other side is captured.
 
 If either stays near 0, fix that source first (`--list-devices` shows what's available).
-Capture always uses the **default** output device's loopback, so whatever you hear the
-call through has to be the Windows default output.
+
+What gets recorded, with no device setup:
+
+- **System:** the loopback of **every** output, mixed. So the other side is captured
+  whichever device Teams, Discord or WhatsApp plays through, default or not. A Bluetooth
+  headset's "Hands-Free" output is only opened while something plays to it, so the
+  recorder never pushes the headset into call mode.
+- **Mic:** the one your meeting app is recording from, whichever device it was set to.
+  With no call going (recording a room), the Windows default input.
+- **Devices may come and go mid-recording.** Plug a headset in halfway, or lose it to a
+  flat battery, and the recording carries on with whatever is there now. The same goes
+  for the meeting app switching mics. Every stream is placed on a shared clock, so a
+  switch costs at most a fraction of a second, and mic and system stay in sync. The
+  console (or `tray.log`) shows each change as `+ mic: …` / `- system: …`.
 
 ## Use it
 
@@ -151,7 +163,7 @@ Press **Enter** to stop recording. Other options:
 | `--no-diarization` | Plain transcript, no speaker labels. |
 | `--language xx` | Override the language for this run. |
 | `--mic-gain N` | Extra multiplier for your own voice on top of the automatic levelling (default 1). |
-| `--list-devices` | Show microphones and loopback devices. |
+| `--list-devices` | Show microphones and outputs: which are the default, which a meeting app is using. |
 | `--server-up` / `--server-down` | Start the server and leave it up / stop it. |
 | `--keep-server` | Start the server if needed and leave it running afterwards. |
 | `--no-manage-server` | Don't touch Docker; assume the server is already running. |
@@ -246,8 +258,10 @@ it on in **System Settings › Privacy & Security › Screen & System Audio Reco
 
 The tap records **everything the Mac plays**, through whichever output is active, and
 keeps following it when you switch to AirPods mid-call. There's no "default output"
-to set up, and no BlackHole needed. The mic follows the system's default input;
-set `MIC_NAME` to pin one (`--list-devices` shows them).
+to set up, and no BlackHole needed. The mic is the one your meeting app is recording
+from (macOS 14+; else the default input), and otherwise follows the system's default
+input as it changes. Set `MIC_NAME` to pin one (`--list-devices` shows them). Devices
+may come and go mid-recording, as on Windows.
 
 ### Menu bar
 
@@ -317,10 +331,11 @@ With `TRANSCRIPTION_INBOX_DIR` set, also `2026-10-28-transcript-weekly-sync.md` 
 
 ## Troubleshooting
 
-- **Your own voice is missing.** Run `--selftest`. If `mic=` is ~0, the wrong input is
-  the Windows default; change it or set `MIC_NAME`.
-- **The other side is missing.** `system=` is ~0: the call is playing through a device
-  that isn't the Windows default output.
+- **Your own voice is missing.** Run `--selftest` and `--list-devices`. If `mic=` is ~0,
+  the recorded mic (your meeting app's, else the default) isn't the one you speak into.
+  Set `MIC_NAME` to pin the right one.
+- **The other side is missing.** `system=` is ~0 while audio plays. Check `--list-devices`
+  for the output the call uses: every listed output is recorded, a disabled one isn't.
 - **"Capture dropouts" warning.** Short gaps in the audio, usually because the machine
   was overloaded (low on RAM) during the call.
 - **"Server didn't start".** Is Docker Desktop running? Does

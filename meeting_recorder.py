@@ -17,7 +17,7 @@ Usage:
     python meeting_recorder.py --title "Weekly sync"
     python meeting_recorder.py --file some.wav # skip recording; transcribe an existing recording (WAV, MP3, …)
     python meeting_recorder.py --list-devices  # show input/output devices
-    python meeting_recorder.py --selftest      # record 5 s and report mic/system levels
+    python meeting_recorder.py --selftest [S]  # record S (default 5) s and report mic/system levels
     python meeting_recorder.py --server-up     # start the server and leave it up
     python meeting_recorder.py --server-down   # stop the server
 
@@ -37,7 +37,7 @@ Settings come from environment variables or a .env file next to this script
 
 Deps:  pip install -r requirements.txt   (plus the `docker` CLI on PATH for Docker mode)
 """
-import argparse, atexit, contextlib, datetime, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, queue, warnings
+import argparse, atexit, collections, contextlib, ctypes, datetime, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, warnings
 import numpy as np
 import requests
 
@@ -88,7 +88,7 @@ CAPTURE_BUFFER = CAPTURE_SR // 2   # 0.5 s WASAPI buffer per stream (see record_
 MIX_TARGET_RMS = 0.08        # ~-22 dBFS for each side's speech
 MIX_MAX_GAIN   = 30.0        # never boost a side more than ~30 dB (don't blow up noise)
 MIC_GAIN    = 1.0            # extra manual mic multiplier on top of the automatic mix
-MIC_NAME    = None           # substring to pick a mic; None = default input
+MIC_NAME    = None           # substring to pin a mic; None = the meeting app's mic, else the default input
 
 # The transcription server is a Docker Compose stack that we only keep running
 # while we actually need it (it holds a GPU and several GB of RAM once the
@@ -180,12 +180,24 @@ def list_devices():
         print("(system audio is a tap on everything the Mac plays, whichever output it goes to)")
         return
     import soundcard as sc
-    print("=== Microphones (inputs) ===")
-    for m in sc.all_microphones(include_loopback=True):
-        tag = " [LOOPBACK]" if getattr(m, "isloopback", False) else ""
-        print(f"  {m.name}{tag}")
-    print(f"\nDefault mic:     {sc.default_microphone().name}")
-    print(f"Default speaker: {sc.default_speaker().name}  (its loopback is what we capture as 'system')")
+    devs = sc.all_microphones(include_loopback=True)
+    busy = _windows_busy_endpoints() or set()
+    defaults = set()
+    for get in (sc.default_microphone, sc.default_speaker):
+        with contextlib.suppress(Exception):
+            defaults.add(get().id)
+
+    def show(d):
+        print(f"  {d.name}" + ("  [default]" if d.id in defaults else "")
+              + ("  [in use by another app]" if d.id in busy else ""))
+    print("=== Microphones (recorded: MIC_NAME if set, else the one another app uses, else the default) ===")
+    for d in devs:
+        if not d.isloopback:
+            show(d)
+    print("\n=== Outputs (all recorded as 'system', via loopback; Hands-Free ones only while in use) ===")
+    for d in devs:
+        if d.isloopback:
+            show(d)
 
 
 # --------------------------------------------------- macOS capture helper
@@ -256,47 +268,435 @@ class _HelperRecorder:
             self.proc.kill()
 
 
-def _mac_default_names():
-    """(default mic, default output) as shown by `audiocap list`."""
-    out = subprocess.run([audiocap_path(), "list"], capture_output=True, text=True).stdout
-    names = dict(re.findall(r"^Default (mic|speaker):\s+(.*)$", out, re.M))
-    return names.get("mic", "default input"), names.get("speaker", "default output")
+# ---------------------------------------------------------------- capture
+# Devices come and go during a meeting: a headset connects or drops out, the
+# meeting app moves to another mic, a monitor with speakers goes to sleep. So
+# nothing is fixed when recording starts. Every stream (a mic, one output's
+# loopback, a macOS helper) runs in its own thread and adds its audio into a
+# shared timeline at the wall-clock time it was captured, and a supervisor
+# starts and stops streams as devices appear and disappear. The WAV is written
+# from that timeline a few seconds behind real time, so a stream that stalls,
+# restarts or switches device leaves at most a short silence in its own
+# channel, and mic and system stay aligned throughout.
+#
+# What gets recorded:
+#   system  Windows: the loopback of EVERY output, summed, so it doesn't matter
+#           which device Teams/Discord/WhatsApp plays through. (A Bluetooth
+#           headset's "Hands-Free" output only while something plays to it.)
+#           macOS: the helper's process tap, which already covers all output.
+#   mic     MIC_NAME if that mic is present; else the mic another app (the
+#           meeting) is recording from, whichever device that is; else the
+#           system default input (e.g. recording a room, no meeting).
+TIMELINE_LAG = 3.0           # s the WAV trails real time, so late blocks still land in place
+SYNC_SKEW    = 0.1           # s a stream may drift from its wall-clock position before it's re-aligned
+SYNC_WINDOW  = 10            # blocks (1 s) of arrival delays to judge that on
+STALL_SECS   = 5.0           # s without a block before a running stream counts as hung
+DEVICE_POLL  = 1.0           # s between device checks
+MIC_SETTLE   = 2.0           # s a new mic choice must hold before we switch (apps probe devices briefly)
+MIC, SYSTEM  = 0, 1          # timeline / WAV channels
+_CH_NAMES    = ("mic", "system")
 
 
-def _open_streams(sc):
-    if sc is None:                                    # macOS
-        mic_name, spk_name = _mac_default_names()
-        mic_dev = _HelperSource("mic", f"{MIC_NAME} (match)" if MIC_NAME else mic_name, MIC_NAME)
-        loop_dev = _HelperSource("system", "system audio")
-        return mic_dev, loop_dev, _HelperSource("system", f"process tap on all output (now: {spk_name})")
-    mic_dev = sc.default_microphone()
-    if MIC_NAME:
-        mic_dev = sc.get_microphone(MIC_NAME, include_loopback=False)
-    spk = sc.default_speaker()
-    loop_dev = sc.get_microphone(spk.name, include_loopback=True)
-    return mic_dev, loop_dev, spk
+class _Timeline:
+    """Two channels (MIC, SYSTEM) at TARGET_SR, indexed by frames since t0 on
+    the monotonic clock. Streams add into it; the writer pops finished frames
+    off the front. Wherever nothing was added is silence."""
+
+    def __init__(self, t0):
+        self.t0 = t0
+        self.lock = threading.Lock()
+        self.base = 0                             # frame index of buf[0]
+        self.buf = np.zeros((0, 2), np.float32)
+        self.end = 0                              # one past the last frame anything wrote
+
+    def frame(self, t):
+        return int(round((t - self.t0) * TARGET_SR))
+
+    def add(self, ch, pos, data):
+        with self.lock:
+            if pos < self.base:                   # partly older than what's already written
+                data, pos = data[self.base - pos:], self.base
+            if not len(data) or pos - self.base > 60 * TARGET_SR:
+                return
+            i, j = pos - self.base, pos - self.base + len(data)
+            if j > len(self.buf):
+                self.buf = np.concatenate(
+                    [self.buf, np.zeros((max(j - len(self.buf), TARGET_SR), 2), np.float32)])
+            self.buf[i:j, ch] += data
+            self.end = max(self.end, pos + len(data))
+
+    def pop(self, upto):
+        """Frames [base, upto)."""
+        with self.lock:
+            n = upto - self.base
+            if n <= 0:
+                return np.zeros((0, 2), np.float32)
+            out = self.buf[:n]
+            if len(out) < n:
+                out = np.concatenate([out, np.zeros((n - len(out), 2), np.float32)])
+            self.buf = self.buf[n:]
+            self.base = upto
+            return out
 
 
-def _capture_loop(recorder_ctx, q, stop_event):
-    """Drain one WASAPI stream continuously into a queue. Running each stream in
-    its own thread means neither buffer overflows while the other is processed,
-    which is what caused the 'data discontinuity' drops (and slow mic/system
-    desync over a long meeting). A failure is queued too, so the mixer raises
-    it instead of waiting forever on a stream that has died."""
+class _Source:
+    """One capture stream in its own thread. Each block goes on the timeline
+    where it was captured: its arrival time minus its length. Arrival can only
+    be late, never early, so a block that arrives before its slot means the
+    stream sits too late (drop the overlap), and a stream whose blocks ALL
+    arrived late for a whole SYNC_WINDOW has lost samples (skip ahead).
+    Ordinary jitter is left alone, so the audio stays contiguous."""
+
+    def __init__(self, timeline, ch, label, device, channels):
+        self.tl, self.ch, self.label = timeline, ch, label
+        self.device, self.channels = device, channels
+        self.stop = threading.Event()
+        self.error = None
+        self.rec = None
+        self.pos = None                           # timeline frame for the next block
+        self.last = None                          # when the last block arrived
+        self.delays = collections.deque(maxlen=SYNC_WINDOW)
+        self.started_at = time.monotonic()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            with self.device.recorder(samplerate=CAPTURE_SR, channels=self.channels,
+                                      blocksize=CAPTURE_BUFFER) as rec:
+                self.rec = rec
+                while not self.stop.is_set():
+                    block = rec.record(numframes=BLOCK)
+                    if not self.stop.is_set():
+                        self._place(block, time.monotonic())
+        except Exception as e:                    # device gone, helper died, …: the supervisor decides
+            if not self.stop.is_set():
+                self.error = e
+
+    def _place(self, block, arrived):
+        self.last = arrived
+        x = block.mean(axis=1)
+        n = (len(x) // DECIM) * DECIM
+        x = x[:n].reshape(-1, DECIM).mean(axis=1)
+        end = self.tl.frame(arrived)
+        if self.pos is None:
+            self.pos = end - len(x)
+        delay = end - (self.pos + len(x))
+        skew = int(SYNC_SKEW * TARGET_SR)
+        if delay < -skew:
+            x = x[-delay:]
+            self.delays.clear()
+        else:
+            self.delays.append(delay)
+            if len(self.delays) == SYNC_WINDOW and min(self.delays) > skew:
+                self.pos += min(self.delays)
+                self.delays.clear()
+        self.tl.add(self.ch, self.pos, x)
+        self.pos += len(x)
+
+
+class _Capture:
+    """Keeps one _Source running per wanted stream. `discover()` says what's
+    wanted right now, as {key: (channel, label, device, channels)}; a stream
+    whose device has gone is stopped, a new device gets a stream, and one that
+    died or hung is retried for as long as its device is still wanted."""
+
+    def __init__(self, timeline, discover):
+        self.tl, self.discover = timeline, discover
+        self.sources = {}                         # key -> _Source
+        self.retired = []                         # stopped, possibly still winding down
+        self.retry = {}                           # key -> (not before, backoff s)
+        self.wanted = {}
+
+    def poll(self, rediscover=True):
+        now = time.monotonic()
+        ended = []
+        for key, src in list(self.sources.items()):
+            if src.thread.is_alive():
+                if src.last is None or now - src.last < STALL_SECS:
+                    continue
+                src.error = TimeoutError(f"no audio for {now - src.last:.0f}s")
+                src.stop.set()
+                self.retired.append(src)
+            del self.sources[key]
+            ended.append((key, src))
+        if rediscover or ended:           # a stream that ended may mean its device is gone: look now
+            try:
+                self.wanted = self.discover()
+            except Exception as e:
+                print(f"  ! device check failed ({type(e).__name__}: {e}); keeping the current devices")
+        for key, src in ended:
+            why = f"{type(src.error).__name__}: {src.error}"
+            if key not in self.wanted:
+                print(f"  - {_CH_NAMES[src.ch]}: {src.label} (gone: {why})")
+                continue
+            # One that ran a while is restarted at once; one that keeps
+            # failing to open backs off, up to 10 s.
+            wait = (0.0 if now - src.started_at > 10
+                    else min(max(self.retry.get(key, (0, 0.0))[1], 0.5) * 2, 10.0))
+            self.retry[key] = (now + wait, wait)
+            print(f"  ! {_CH_NAMES[src.ch]} {src.label} stopped ({why}); "
+                  + (f"retrying in {wait:g}s" if wait else "restarting"))
+        for key, (ch, label, device, channels) in self.wanted.items():
+            if key not in self.sources and self.retry.get(key, (0,))[0] <= now:
+                self.sources[key] = _Source(self.tl, ch, label, device, channels)
+                print(f"  + {_CH_NAMES[ch]}: {label}")
+        # A replaced mic keeps recording until its successor delivers, so a
+        # switch never leaves a hole; anything else no longer wanted stops now.
+        mic_wanted = any(w[0] == MIC for w in self.wanted.values())
+        mic_live = any(s.pos is not None for k, s in self.sources.items()
+                       if s.ch == MIC and k in self.wanted)
+        for key, src in list(self.sources.items()):
+            if key in self.wanted or (src.ch == MIC and mic_wanted and not mic_live):
+                continue
+            src.stop.set()
+            del self.sources[key]
+            self.retired.append(src)
+            print(f"  - {_CH_NAMES[src.ch]}: {src.label}")
+        for key in [k for k in self.retry if k not in self.wanted]:
+            del self.retry[key]
+        self.retired = [s for s in self.retired if s.thread.is_alive()]
+
+    def close(self):
+        everything = list(self.sources.values()) + self.retired
+        for src in everything:
+            src.stop.set()
+        deadline = time.monotonic() + 2.0
+        for src in everything:
+            src.thread.join(max(0.0, deadline - time.monotonic()))
+            if src.thread.is_alive() and isinstance(src.rec, _HelperRecorder):
+                src.rec.__exit__(None, None, None)    # unblock a helper stuck mid-read
+        self.sources, self.retired = {}, []
+
+
+class _MicPicker:
+    """Which mic to record: MIC_NAME when that mic is present; else the mic
+    another app is recording from (the meeting app's, whichever device it was
+    set to; the default if that's among them); else the default input. A new
+    choice must hold for MIC_SETTLE s before it's taken, unless the current
+    mic has disappeared."""
+
+    def __init__(self):
+        self.cur = self.pending = None
+        self.since = 0.0
+
+    def pick(self, names, default, busy):
+        """names: {id: name} of the mics present now; default: the default
+        input's id, or None; busy: ids another process is recording from.
+        Returns the id to record, or None when there's no mic at all."""
+        want = None
+        if MIC_NAME:
+            want = next((i for i, n in names.items() if MIC_NAME.lower() in n.lower()), None)
+        if want is None:
+            in_use = sorted(i for i in names if i in busy)
+            want = next((i for i in (self.cur, default, *in_use) if i in in_use), None)
+        if want is None:
+            want = default if default in names else next(iter(sorted(names)), None)
+        now = time.monotonic()
+        if want == self.cur or self.cur not in names:
+            self.cur, self.pending = want, None
+        elif want != self.pending:
+            self.pending, self.since = want, now
+        elif now - self.since >= MIC_SETTLE:
+            self.cur, self.pending = want, None
+        return self.cur
+
+
+# ------------------------------------------------- Windows device discovery
+def _windows_busy_endpoints():
+    """Endpoint ids of the devices, inputs and outputs, that another process
+    is streaming on right now (in practice: the meeting app's mic and
+    speaker), from the WASAPI audio sessions on each device. None if that
+    can't be determined."""
+    from ctypes import POINTER, byref, c_int, c_uint, c_void_p, c_wchar_p
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16),
+                    ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+
+    def guid(s):
+        g = GUID()
+        ctypes.oledll.ole32.CLSIDFromString(s, byref(g))
+        return g
+
+    def call(obj, index, argtypes, *args):        # COM method by vtable slot; failures raise OSError
+        fn = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0][index]
+        return ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p, *argtypes)(fn)(obj, *args)
+
+    def release(obj):
+        if obj:
+            fn = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0][2]
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)(fn)(obj)
+
+    CLSCTX_ALL, eAll, DEVICE_STATE_ACTIVE, AudioSessionStateActive = 23, 2, 1, 1
+    ole32 = ctypes.windll.ole32
+    ole32.CoTaskMemFree.argtypes = [c_void_p]
+    hr = ole32.CoInitializeEx(None, 0)            # MTA, like soundcard; S_FALSE / changed mode are fine
+    busy, held = set(), []
     try:
-        with recorder_ctx as rec:
-            while not stop_event.is_set():
-                q.put(rec.record(numframes=BLOCK))
-    except Exception as e:
-        if not stop_event.is_set():
-            q.put(e)
+        enum, coll, count = c_void_p(), c_void_p(), c_uint()
+        ctypes.oledll.ole32.CoCreateInstance(
+            byref(guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}")), None, CLSCTX_ALL,
+            byref(guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}")), byref(enum))
+        held.append(enum)
+        call(enum, 3, (c_uint, c_uint, POINTER(c_void_p)), eAll, DEVICE_STATE_ACTIVE, byref(coll))
+        held.append(coll)
+        call(coll, 3, (POINTER(c_uint),), byref(count))
+        iid_mgr2 = guid("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
+        iid_ctl2 = guid("{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+        for i in range(count.value):
+            objs = []
+            try:
+                dev, idp = c_void_p(), c_wchar_p()
+                call(coll, 4, (c_uint, POINTER(c_void_p)), i, byref(dev))
+                objs.append(dev)
+                call(dev, 5, (POINTER(c_wchar_p),), byref(idp))
+                dev_id = idp.value
+                ole32.CoTaskMemFree(ctypes.cast(idp, c_void_p))
+                mgr, sessions, n = c_void_p(), c_void_p(), c_int()
+                call(dev, 3, (POINTER(GUID), c_uint, c_void_p, POINTER(c_void_p)),
+                     byref(iid_mgr2), CLSCTX_ALL, None, byref(mgr))
+                objs.append(mgr)
+                call(mgr, 5, (POINTER(c_void_p),), byref(sessions))
+                objs.append(sessions)
+                call(sessions, 3, (POINTER(c_int),), byref(n))
+                for j in range(n.value):
+                    ctl, ctl2, state, pid = c_void_p(), c_void_p(), c_int(), c_uint()
+                    try:
+                        call(sessions, 4, (c_int, POINTER(c_void_p)), j, byref(ctl))
+                        call(ctl, 3, (POINTER(c_int),), byref(state))
+                        if state.value != AudioSessionStateActive:
+                            continue
+                        call(ctl, 0, (POINTER(GUID), POINTER(c_void_p)), byref(iid_ctl2), byref(ctl2))
+                        call(ctl2, 14, (POINTER(c_uint),), byref(pid))
+                        if pid.value not in (0, os.getpid()):
+                            busy.add(dev_id)
+                    finally:
+                        release(ctl2)
+                        release(ctl)
+            except OSError:
+                pass                              # one odd device mustn't hide the others
+            finally:
+                for o in reversed(objs):
+                    release(o)
+        return busy
+    except OSError:
+        return None
+    finally:
+        for o in reversed(held):
+            release(o)
+        if hr in (0, 1):
+            ole32.CoUninitialize()
 
 
-def _take(q, timeout):
-    item = q.get(timeout=timeout)
-    if isinstance(item, Exception):
-        raise item
-    return item
+def _windows_discover():
+    import soundcard as sc
+    picker = _MicPicker()
+
+    def default_id(get):
+        try:
+            return get().id
+        except Exception:                         # no such device at all right now
+            return None
+
+    def discover():
+        devs = sc.all_microphones(include_loopback=True)
+        busy = _windows_busy_endpoints() or set()
+        mics = {d.id: d for d in devs if not d.isloopback}
+        mic = picker.pick({i: d.name for i, d in mics.items()}, default_id(sc.default_microphone), busy)
+        wanted = {("mic", mic): (MIC, mics[mic].name, mics[mic], 1)} if mic is not None else {}
+        # The loopback of every output, whichever one the meeting plays
+        # through. Except a Bluetooth headset's Hands-Free output, opened only
+        # while something plays to it: that output is the headset's call mode.
+        speaker = default_id(sc.default_speaker)
+        for d in devs:
+            if d.isloopback and ("hands-free" not in d.name.lower() or d.id in busy or d.id == speaker):
+                wanted[("system", d.id)] = (SYSTEM, f"{d.name} (loopback)", d, 2)
+        return wanted
+    return discover
+
+
+# --------------------------------------------------- macOS device discovery
+class _CAAddress(ctypes.Structure):
+    _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+
+def _mac_inputs():
+    """({device id: name} of the input devices, the default input's id, the ids
+    another process is recording from), straight from Core Audio. The process
+    objects (macOS 14+) are what say which mic the meeting app is using; our
+    own capture helper is left out of that."""
+    ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+    u32, P = ctypes.c_uint32, ctypes.POINTER
+    ca.AudioObjectGetPropertyDataSize.argtypes = [u32, P(_CAAddress), u32, ctypes.c_void_p, P(u32)]
+    ca.AudioObjectGetPropertyData.argtypes = [u32, P(_CAAddress), u32, ctypes.c_void_p, P(u32), ctypes.c_void_p]
+    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, u32]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+    def get(obj, sel, ctype, scope=b"glob", many=False):
+        addr = _CAAddress(int.from_bytes(sel, "big"), int.from_bytes(scope, "big"), 0)
+        size = u32(0)
+        if ca.AudioObjectGetPropertyDataSize(obj, ctypes.byref(addr), 0, None, ctypes.byref(size)):
+            return [] if many else None
+        n = size.value // ctypes.sizeof(ctype)
+        buf = (ctype * max(n, 1))()
+        if not n or ca.AudioObjectGetPropertyData(obj, ctypes.byref(addr), 0, None, ctypes.byref(size),
+                                                  ctypes.cast(buf, ctypes.c_void_p)):
+            return [] if many else None
+        return list(buf[:n]) if many else buf[0]
+
+    def name(dev):
+        ref = get(dev, b"lnam", ctypes.c_void_p)
+        if not ref:
+            return f"device {dev}"
+        s = ctypes.create_string_buffer(1024)
+        cf.CFStringGetCString(ref, s, len(s), 0x08000100)      # kCFStringEncodingUTF8
+        cf.CFRelease(ref)
+        return s.value.decode("utf-8", "replace")
+
+    def is_helper(pid):
+        path = ctypes.create_string_buffer(4096)
+        n = libproc.proc_pidpath(pid, path, len(path))
+        return n > 0 and os.path.realpath(path.value.decode("utf-8", "replace")) == os.path.realpath(AUDIOCAP)
+
+    SYS = 1                                       # kAudioObjectSystemObject
+    names = {d: name(d) for d in get(SYS, b"dev#", u32, many=True)
+             if get(d, b"stm#", u32, scope=b"inpt", many=True)}
+    names = {d: n for d, n in names.items() if not n.startswith("transcribe-local")}
+    default = get(SYS, b"dIn ", u32)
+    busy = set()
+    for proc in get(SYS, b"prs#", u32, many=True):              # kAudioHardwarePropertyProcessObjectList
+        if not get(proc, b"piri", u32):                          # kAudioProcessPropertyIsRunningInput
+            continue
+        pid = get(proc, b"ppid", ctypes.c_int32)
+        if pid is None or pid == os.getpid() or is_helper(pid):
+            continue
+        busy.update(d for d in get(proc, b"pdv#", u32, scope=b"inpt", many=True) if d in names)
+    return names, default, busy
+
+
+def _mac_discover():
+    picker = _MicPicker()
+    system = _HelperSource("system", "everything the Mac plays (process tap)")
+
+    def discover():
+        try:
+            names, default, busy = _mac_inputs()
+            # "Whatever the default input is" counts as a device of its own
+            # (id 0, never a real one), so a change of default isn't a change
+            # of mic: the helper follows the default itself, instantly.
+            busy = {0 if d == default else d for d in busy}
+            mic = picker.pick({0: "", **names}, 0, busy)
+            device = names[mic] if mic else None
+        except Exception:                         # can't inspect devices: the helper's own choice
+            device = MIC_NAME
+        label = device or "default input"
+        return {("system",): (SYSTEM, system.name, system, 2),
+                ("mic", device): (MIC, label, _HelperSource("mic", label, device), 1)}
+    return discover
 
 
 _dropouts = 0
@@ -319,93 +719,56 @@ def _count_dropouts():
 
 
 def record_session(wav_path, stop_event, selftest_seconds=None):
-    """Capture mic + system loopback on separate threads and write a 16 kHz
-    16-bit STEREO WAV: left = mic, right = system, both unprocessed. Levels are
-    balanced later, at transcription time (see mix_for_upload), so the raw
-    recording can always be remixed. Memory stays flat: each block is downsampled
-    and written immediately. Blocks are paired 1:1, so the two streams stay in sync."""
-    if MACOS:
-        sc = None
-    else:
-        import soundcard as sc
+    """Record the mic and all system audio to a 16 kHz 16-bit STEREO WAV:
+    left = mic, right = system, both unprocessed. Levels are balanced later, at
+    transcription time (see mix_for_upload), so the raw recording can always be
+    remixed. Devices may come and go at any point (see the capture section
+    above). Memory stays flat: the WAV is written as the timeline fills."""
     _count_dropouts()
-    mic_dev, loop_dev, spk = _open_streams(sc)
-    print(f"Mic:    {mic_dev.name}")
-    print(f"System: {spk.name}" + ("" if MACOS else " (loopback)"))
+    discover = _mac_discover() if MACOS else _windows_discover()
     os.makedirs(os.path.dirname(wav_path), exist_ok=True)
-
-    # 0.5 s WASAPI buffers: soundcard's default (one ~10 ms device period) drops
-    # audio whenever Python stalls briefly, e.g. when the machine is short on RAM.
-    mic_q, sys_q = queue.Queue(), queue.Queue()
-    cap_stop = threading.Event()
-    t_mic = threading.Thread(target=_capture_loop,
-        args=(mic_dev.recorder(samplerate=CAPTURE_SR, channels=1, blocksize=CAPTURE_BUFFER),
-              mic_q, cap_stop), daemon=True)
-    t_sys = threading.Thread(target=_capture_loop,
-        args=(loop_dev.recorder(samplerate=CAPTURE_SR, channels=2, blocksize=CAPTURE_BUFFER),
-              sys_q, cap_stop), daemon=True)
-
-    peak_mic = peak_sys = 0.0
-    blocks = 0
+    tl = _Timeline(time.monotonic())
+    cap = _Capture(tl, discover)
+    peak = [0.0, 0.0]
+    frames = 0
     wf = wave.open(wav_path, "wb")
     wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(TARGET_SR)
 
-    def _down(x):
-        n = (len(x) // DECIM) * DECIM
-        return x[:n].reshape(-1, DECIM).mean(axis=1)
-
-    def _mix_write(mic, sysd):
-        nonlocal peak_mic, peak_sys, blocks
-        mic_m = mic[:, 0]
-        sys_m = sysd.mean(axis=1)
-        peak_mic = max(peak_mic, float(np.abs(mic_m).max(initial=0.0)))
-        peak_sys = max(peak_sys, float(np.abs(sys_m).max(initial=0.0)))
-        st = np.stack([_down(mic_m), _down(sys_m)], axis=1)
+    def write(st):
+        nonlocal frames
+        if not len(st):
+            return
+        for ch in (MIC, SYSTEM):
+            peak[ch] = max(peak[ch], float(np.abs(st[:, ch]).max()))
         np.clip(st, -1.0, 1.0, out=st)
         wf.writeframes((st * 32767.0).astype("<i2").tobytes())
-        blocks += 1
+        frames += len(st)
 
     try:
         _keep_awake(True)                 # block system sleep for the duration
-        t_mic.start(); t_sys.start()
         print("● Recording…  (press Enter to stop)" if selftest_seconds is None
-              else f"● Self-test: capturing {selftest_seconds}s…")
-        # The streams rarely start at the same instant (on macOS the very first
-        # run even waits for a permission prompt). Pair them from the moment
-        # both are live, dropping whatever the early one captured before that.
-        mic = sysd = None
-        while not stop_event.is_set() and (mic is None or sysd is None):
-            with contextlib.suppress(queue.Empty):
-                mic = mic if mic is not None else _take(mic_q, 0.2)
-                sysd = sysd if sysd is not None else _take(sys_q, 0.2)
-        if mic is not None and sysd is not None:
-            while mic_q.qsize() > 1 and not isinstance(mic_q.queue[0], Exception):
-                mic = mic_q.get()
-            while sys_q.qsize() > 1 and not isinstance(sys_q.queue[0], Exception):
-                sysd = sys_q.get()
-            _mix_write(mic, sysd)
-        mic = None
-        t0 = time.monotonic()
+              else f"● Self-test: capturing {selftest_seconds:g}s…")
+        next_check = 0.0
         while not stop_event.is_set():
-            try:
-                if mic is None:               # keep a mic block while its partner is late
-                    mic = _take(mic_q, 1.0)
-                sysd = _take(sys_q, 1.0)
-            except queue.Empty:
-                continue
-            _mix_write(mic, sysd)
-            mic = None
-            if selftest_seconds is not None and time.monotonic() - t0 >= selftest_seconds:
+            now = time.monotonic()
+            if selftest_seconds is not None and now - tl.t0 >= selftest_seconds:
                 break
+            try:
+                cap.poll(rediscover=now >= next_check)
+            except Exception as e:        # never let device handling end a recording
+                print(f"  ! capture supervisor: {type(e).__name__}: {e}")
+            if now >= next_check:
+                next_check = now + DEVICE_POLL
+            write(tl.pop(tl.frame(now - TIMELINE_LAG)))
+            stop_event.wait(0.1)
     finally:
-        cap_stop.set()
-        # drain whatever both streams already captured, keeping them paired
-        drained = [[x for x in list(q_.queue) if not isinstance(x, Exception)] for q_ in (mic_q, sys_q)]
-        for m, s in zip(*drained):
-            _mix_write(m, s)
+        end = tl.frame(time.monotonic())
+        cap.close()
+        write(tl.pop(max(end, tl.end)))
         wf.close()
         _keep_awake(False)                # allow sleep again
-    secs = blocks * BLOCK / CAPTURE_SR
+    secs = frames / TARGET_SR
+    peak_mic, peak_sys = peak
     print(f"■ Stopped. {secs:0.1f}s written -> {wav_path}  (stereo: L=mic, R=system)")
     print(f"   peak level  mic={peak_mic:0.3f}  system={peak_sys:0.3f}")
     if _dropouts:
@@ -1130,7 +1493,8 @@ def main():
     ap.add_argument("--speakers", type=int, default=None, help="expected number of speakers (hint for diarization)")
     ap.add_argument("--no-diarization", action="store_true")
     ap.add_argument("--list-devices", action="store_true")
-    ap.add_argument("--selftest", action="store_true", help="record 5 s and report mic/system levels")
+    ap.add_argument("--selftest", nargs="?", const=5.0, type=float, metavar="SECONDS",
+                    help="record SECONDS (default 5) and report mic/system levels")
     ap.add_argument("--mic-gain", type=float, default=MIC_GAIN,
                     help=f"extra mic multiplier on top of the automatic mix (default {MIC_GAIN:g})")
     ap.add_argument("--no-manage-server", action="store_true",
@@ -1153,9 +1517,9 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True); os.makedirs(AUDIO_DIR, exist_ok=True)
     label = ("_" + args.title.replace(" ", "-")) if args.title else ""
 
-    if args.selftest:
+    if args.selftest is not None:
         wav = os.path.join(AUDIO_DIR, f"selftest_{_ts()}.wav")
-        record_session(wav, threading.Event(), selftest_seconds=5); return
+        record_session(wav, threading.Event(), selftest_seconds=args.selftest); return
 
     if args.file:
         wav = args.file

@@ -37,9 +37,11 @@ Settings come from environment variables or a .env file next to this script
 
 Deps:  pip install -r requirements.txt   (plus the `docker` CLI on PATH for Docker mode)
 """
-import argparse, atexit, collections, contextlib, ctypes, datetime, io, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, warnings
+import argparse, atexit, collections, contextlib, ctypes, datetime, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, warnings
 # numpy's OpenBLAS starts a worker per CPU core, each committing a large
 # buffer (~700 MB on a 22-core machine), for matrix maths this never does.
+# Only for this process: the server we launch doesn't inherit it (_server_env).
+_OUR_OPENBLAS_CAP = "OPENBLAS_NUM_THREADS" not in os.environ
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import numpy as np
 import requests
@@ -895,12 +897,21 @@ def _compose_cmd(*args):
     return ["docker", "compose", *files, *args]
 
 
+def _server_env(**extra):
+    """Our environment for the server, minus the OpenBLAS thread cap we set for
+    ourselves: the server does real matrix maths (diarization clustering)."""
+    env = dict(os.environ, **extra)
+    if _OUR_OPENBLAS_CAP:
+        env.pop("OPENBLAS_NUM_THREADS", None)
+    return env
+
+
 def _compose_env():
     """The server's diarization model needs a Hugging Face token. A manual
     checkout's .env often leaves HUGGINGFACE_TOKEN empty, so pass ours (HF_TOKEN
     or HUGGINGFACE_TOKEN from the environment or our .env) through; compose
     prefers the process environment over its .env file."""
-    env = dict(os.environ)
+    env = _server_env()
     tok = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
     if tok:
         env["HUGGINGFACE_TOKEN"] = tok
@@ -963,7 +974,7 @@ def _metal_env():
     data = os.path.join(TS_DATA_DIR, "data")
     for d in ("logs", "audio", "tokens"):
         os.makedirs(os.path.join(data, d), exist_ok=True)
-    env = dict(os.environ, DATA_DIR=data, HF_HOME=os.path.join(TS_DATA_DIR, "models"),
+    env = _server_env(DATA_DIR=data, HF_HOME=os.path.join(TS_DATA_DIR, "models"),
                USER_CONFIG_DIR=os.path.join(TS_DATA_DIR, "server-config"),
                LOG_DIR=os.path.join(data, "logs"), LOG_LEVEL="INFO", PYTHONUNBUFFERED="1")
     ffmpeg = os.path.join(os.path.dirname(_metal_backend_dir()), "ffmpeg")   # bundled fallback
@@ -1275,7 +1286,8 @@ def transcribe_file(wav_path, language=LANGUAGE, diarization=True, expected_spea
 class _StreamedForm:
     """A multipart/form-data body (plain fields plus one file) that streams the
     file from disk. requests' own files= reads the whole file into memory and
-    then copies it into the body: ~600 MB at once for a 2.5 h meeting."""
+    then copies it into the body: ~600 MB at once for a 2.5 h meeting. It can
+    seek, so requests can rewind it to re-send it after a 307/308 redirect."""
 
     def __init__(self, fields, field, filename, path, mime):
         boundary = os.urandom(16).hex()
@@ -1284,21 +1296,41 @@ class _StreamedForm:
                        for k, v in fields.items())
         head += (f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
                  f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n')
-        head, tail = head.encode("utf-8"), f"\r\n--{boundary}--\r\n".encode()
+        self._head, self._tail = head.encode("utf-8"), f"\r\n--{boundary}--\r\n".encode()
+        self._size = os.path.getsize(path)
         self.content_type = f"multipart/form-data; boundary={boundary}"
-        self.len = len(head) + os.path.getsize(path) + len(tail)   # requests sends it as Content-Length
+        self.len = len(self._head) + self._size + len(self._tail)   # requests sends it as Content-Length
         self._fh = open(path, "rb")
-        self._parts = [io.BytesIO(head), self._fh, io.BytesIO(tail)]
+        self._pos = 0
 
     def read(self, n=-1):
-        out = b""
-        while self._parts and (n < 0 or len(out) < n):
-            chunk = self._parts[0].read(-1 if n < 0 else n - len(out))
-            if chunk:
-                out += chunk
+        left = self.len - self._pos if n is None or n < 0 else min(n, self.len - self._pos)
+        out = []
+        while left > 0:
+            p, file_end = self._pos, len(self._head) + self._size
+            if p < len(self._head):
+                chunk = self._head[p:p + left]
+            elif p < file_end:
+                self._fh.seek(p - len(self._head))
+                chunk = self._fh.read(min(left, file_end - p))
+                if not chunk:
+                    raise OSError(f"{self._fh.name} shrank while uploading")
             else:
-                self._parts.pop(0)
-        return out
+                chunk = self._tail[p - file_end:p - file_end + left]
+            out.append(chunk)
+            self._pos += len(chunk)
+            left -= len(chunk)
+        return b"".join(out)
+
+    def __iter__(self):                 # makes requests treat it as a stream, the only kind it rewinds
+        return iter(lambda: self.read(1 << 16), b"")
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=0):
+        self._pos = max(0, offset + (0, self._pos, self.len)[whence])
+        return self._pos
 
     def close(self):
         self._fh.close()

@@ -122,16 +122,16 @@ def refresh_icon():
     inside progress callbacks, where an error would fail a finished job."""
     if icon is None:
         return
-    rec, busy = state["recording"], state["busy"]
-    kind = "rec" if rec else "busy" if busy else "idle"
-    if rec:
-        title = f"Meeting recorder — RECORDING {_clock(time.monotonic() - state['started'])}"
-    else:
-        title = "Meeting recorder — " + (status_line() if busy else "idle")
-    title = title[:127]           # the shell's limit; longer raises ValueError in pystray
-    menu = (kind, status_line())
     try:
-        with _icon_lock:
+        with _icon_lock:          # read state inside it too, or a stale view could be applied last
+            rec, busy = state["recording"], state["busy"]
+            kind = "rec" if rec else "busy" if busy else "idle"
+            if rec:
+                title = f"Meeting recorder — RECORDING {_clock(time.monotonic() - state['started'])}"
+            else:
+                title = "Meeting recorder — " + (status_line() if busy else "idle")
+            title = title[:127]   # the shell's limit; longer raises ValueError in pystray
+            menu = (kind, status_line())
             if kind != _shown["kind"]:
                 icon.icon = make_image(kind)
                 _shown["kind"] = kind
@@ -210,7 +210,8 @@ def show_result(ok, title, body, folder=None):
         row=0, column=0, rowspan=2, padx=(16, 8), pady=16)
     tk.Label(win, text=title, font=("Segoe UI", 11, "bold")).grid(
         row=0, column=1, sticky="w", pady=(16, 0), padx=(0, 16))
-    tk.Label(win, text=body, justify="left", foreground="#333", wraplength=520).grid(
+    tk.Label(win, text=body, justify="left", foreground="#333",
+             wraplength="390p").grid(     # points, so it scales with the display (520 px at 100%)
         row=1, column=1, sticky="w", pady=(2, 10), padx=(0, 16))
     btns = ttk.Frame(win)
     btns.grid(row=2, column=1, sticky="e", padx=16, pady=(0, 14))

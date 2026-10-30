@@ -301,6 +301,21 @@ MIC, SYSTEM  = 0, 1          # timeline / WAV channels
 _CH_NAMES    = ("mic", "system")
 
 
+def _antialias(taps=95, beta=5.65):
+    """Low-pass for the CAPTURE_SR -> TARGET_SR decimation: a Kaiser-windowed
+    sinc at TARGET_SR's Nyquist (8 kHz). Flat to 7 kHz and >= 59 dB down from
+    9 kHz, so nothing above 8 kHz folds back into the speech band. (A plain
+    3-sample average lets 9-24 kHz, sibilants included, through only ~5 dB
+    down.) Its ~1 ms delay is the same on every stream, so mic and system stay
+    aligned."""
+    n = np.arange(taps) - (taps - 1) / 2
+    h = np.sinc(2 * (TARGET_SR / 2) / CAPTURE_SR * n) * np.kaiser(taps, beta)
+    return (h / h.sum()).astype(np.float32)
+
+
+_AA = _antialias()
+
+
 class _Timeline:
     """Two channels (MIC, SYSTEM) at TARGET_SR, indexed by frames since t0 on
     the monotonic clock. Streams add into it; the writer pops finished frames
@@ -360,6 +375,8 @@ class _Source:
         self.pos = None                           # timeline frame for the next block
         self.last = None                          # when the last block arrived
         self.delays = collections.deque(maxlen=SYNC_WINDOW)
+        self.fir = np.zeros(len(_AA) - 1, np.float32)    # the previous block's tail, for the filter
+        self.phase = 0                            # which filtered sample is the next one kept
         self.started_at = time.monotonic()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -379,9 +396,10 @@ class _Source:
 
     def _place(self, block, arrived):
         self.last = arrived
-        x = block.mean(axis=1)
-        n = (len(x) // DECIM) * DECIM
-        x = x[:n].reshape(-1, DECIM).mean(axis=1)
+        x = np.concatenate([self.fir, block.mean(axis=1, dtype=np.float32)])
+        self.fir = x[-(len(_AA) - 1):]
+        x = np.convolve(x, _AA, "valid")[self.phase::DECIM]      # low-pass, keep every DECIM-th
+        self.phase = (self.phase - len(block)) % DECIM
         end = self.tl.frame(arrived)
         if self.pos is None:
             self.pos = end - len(x)

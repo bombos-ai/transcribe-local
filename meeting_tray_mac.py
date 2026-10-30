@@ -357,7 +357,7 @@ def show_result(ok, title, body, folder=None):
 
 
 # ---------------------------------------------------------------- transcribe window
-LANGS = ["nl", "en", "de", "fr", "es", "it", "pt", "pl", "sv", "da", "no", "fi"]
+LANGS = mr.LANGS
 
 
 def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):

@@ -37,7 +37,10 @@ Settings come from environment variables or a .env file next to this script
 
 Deps:  pip install -r requirements.txt   (plus the `docker` CLI on PATH for Docker mode)
 """
-import argparse, atexit, collections, contextlib, ctypes, datetime, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, warnings
+import argparse, atexit, collections, contextlib, ctypes, datetime, io, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, warnings
+# numpy's OpenBLAS starts a worker per CPU core, each committing a large
+# buffer (~700 MB on a 22-core machine), for matrix maths this never does.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import numpy as np
 import requests
 
@@ -77,6 +80,7 @@ AUDIO_DIR   = os.path.join(OUTPUT_DIR, "recordings")  # WAVs kept here
 # (e.g. a notes app's or knowledge base's inbox). Off when unset.
 INBOX_DIR   = os.environ.get("TRANSCRIPTION_INBOX_DIR") or None
 LANGUAGE    = os.environ.get("TRANSCRIPTION_LANGUAGE") or "nl"
+LANGS       = ["nl", "en", "de", "fr", "es", "it", "pt", "pl", "sv", "da", "no", "fi"]   # the trays' language list
 CAPTURE_SR  = 48000          # WASAPI native; the macOS helper resamples to it
 TARGET_SR   = 16000          # what we send (48000/16000 = 3, clean decimation)
 DECIM       = CAPTURE_SR // TARGET_SR
@@ -1250,6 +1254,38 @@ def transcribe_file(wav_path, language=LANGUAGE, diarization=True, expected_spea
                 os.remove(upload)
 
 
+class _StreamedForm:
+    """A multipart/form-data body (plain fields plus one file) that streams the
+    file from disk. requests' own files= reads the whole file into memory and
+    then copies it into the body: ~600 MB at once for a 2.5 h meeting."""
+
+    def __init__(self, fields, field, filename, path, mime):
+        boundary = os.urandom(16).hex()
+        filename = filename.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A")
+        head = "".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+                       for k, v in fields.items())
+        head += (f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+                 f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n')
+        head, tail = head.encode("utf-8"), f"\r\n--{boundary}--\r\n".encode()
+        self.content_type = f"multipart/form-data; boundary={boundary}"
+        self.len = len(head) + os.path.getsize(path) + len(tail)   # requests sends it as Content-Length
+        self._fh = open(path, "rb")
+        self._parts = [io.BytesIO(head), self._fh, io.BytesIO(tail)]
+
+    def read(self, n=-1):
+        out = b""
+        while self._parts and (n < 0 or len(out) < n):
+            chunk = self._parts[0].read(-1 if n < 0 else n - len(out))
+            if chunk:
+                out += chunk
+            else:
+                self._parts.pop(0)
+        return out
+
+    def close(self):
+        self._fh.close()
+
+
 def _transcribe_request(wav_path, upload, language, diarization, expected_speakers):
     """POST the (mixed) audio to the server and return the result dict. Handles
     both the synchronous /audio response and a job-based fallback."""
@@ -1266,9 +1302,9 @@ def _transcribe_request(wav_path, upload, language, diarization, expected_speake
     name = os.path.basename(wav_path) if upload == wav_path else \
         os.path.splitext(os.path.basename(wav_path))[0] + ".wav"
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    with open(upload, "rb") as fh:
-        files = {"file": (name, fh, mime)}
-        r = requests.post(url, data=data, files=files, timeout=(15, SERVER_TIMEOUT))
+    with contextlib.closing(_StreamedForm(data, "file", name, upload, mime)) as form:
+        r = requests.post(url, data=form, headers={"Content-Type": form.content_type},
+                          timeout=(15, SERVER_TIMEOUT))
     r.raise_for_status()
     result = r.json()
     if "text" in result:

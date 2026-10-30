@@ -127,7 +127,8 @@ What gets recorded, with no device setup:
 pythonw meeting_tray.py
 ```
 
-- **Left-click the icon** to start recording (icon turns red).
+- **Left-click the icon** to start recording (icon turns red; hover it for the
+  elapsed time).
 - **Left-click again** to stop. A popup asks for a title, the number of speakers
   (0 = let the model decide), diarization on/off and the language.
 - The icon turns amber while the server starts (first cold start: ~60–90 s) and the
@@ -136,14 +137,16 @@ pythonw meeting_tray.py
   writes the inbox copy, if one is configured.
 - **Transcribe later** keeps the WAV and skips the server.
 
-Right-click menu:
+Right-click menu (its first line says what the tray is doing):
 
 - **Transcribe an existing recording…** re-runs any saved WAV, or transcribes an
   MP3/M4A/OGG/FLAC from elsewhere. This is also the recovery path when a transcription
   fails: the audio is always kept.
 - **Name speakers in a transcript…** opens the naming dialog for an older `.txt`.
   Saving writes a fresh inbox copy (`-2`, `-3`, …).
-- **Quit**
+- **Open transcripts folder**
+- **Quit** finishes writing a running recording first, and asks before abandoning a
+  running transcription.
 
 Only one tray instance can run; launching it again does nothing. It logs to `tray.log`
 next to the script.

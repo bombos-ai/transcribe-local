@@ -8,7 +8,8 @@ audio is sent to the TranscriptionSuite server and the diarized transcript is
 written to the output folder (see meeting_recorder.OUTPUT_DIR) — no terminal,
 no typing python commands.
 
-The icon is grey when idle, red while recording and amber while transcribing.
+The icon is grey when idle, red while recording (hover it for the elapsed time)
+and amber while transcribing.
 
 Run it with pythonw.exe so there's no console window:
     pythonw meeting_tray.py
@@ -46,16 +47,26 @@ _guard = _k32.CreateMutexW(None, False, "Local\\MeetingRecorderTray")
 if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
     sys.exit(0)
 
+# --- DPI awareness, before any window exists. Without it Windows stretches every
+#     window like a bitmap on a scaled display (125%, 150%, …): blurry dialogs, and
+#     a tray icon scaled up from 32 px. ------------------------------------------
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)    # PROCESS_SYSTEM_DPI_AWARE
+except Exception:
+    pass
+
+import contextlib
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 import pystray
 from PIL import Image, ImageDraw
 import meeting_recorder as mr
 
 
 # ---------------------------------------------------------------- shared state
-state = {"recording": False, "stop_event": None, "rec_thread": None,
-         "wav": None, "started": 0.0, "busy": 0, "status": ""}   # busy = transcriptions running
+state = {"recording": False, "stop_event": None, "rec_thread": None, "wav": None,
+         "started": 0.0, "started_wall": 0.0, "busy": 0, "status": "",   # busy = transcriptions running
+         "quitting": False}
 lock = threading.Lock()
 ui_q = queue.Queue()          # tray thread -> tk main thread requests
 icon = None
@@ -63,34 +74,74 @@ root = None
 
 
 # ---------------------------------------------------------------- tray icon art
-def make_image(recording, busy=False):
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    if recording:
-        d.ellipse((10, 10, 54, 54), fill=(224, 48, 48, 255))          # red disc
-    elif busy:
-        d.ellipse((10, 10, 54, 54), fill=(232, 150, 20, 255))         # amber: working
-    else:
-        d.ellipse((12, 12, 52, 52), outline=(150, 158, 168, 255), width=5)
-        d.ellipse((26, 26, 38, 38), fill=(150, 158, 168, 255))         # grey mic dot
-    return img
+_IMAGES = {}
+
+
+def make_image(kind):
+    """The 64 px tray glyph for "idle", "rec" or "busy". PIL draws without
+    anti-aliasing, so it's drawn at 4x and scaled down for smooth edges."""
+    if kind not in _IMAGES:
+        s = 4
+        img = Image.new("RGBA", (64 * s, 64 * s), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        box = lambda a, b: (a * s, a * s, b * s - 1, b * s - 1)
+        if kind == "rec":
+            d.ellipse(box(10, 54), fill=(224, 48, 48, 255))             # red disc
+        elif kind == "busy":
+            d.ellipse(box(10, 54), fill=(232, 150, 20, 255))            # amber: working
+        else:
+            d.ellipse(box(12, 52), outline=(150, 158, 168, 255), width=5 * s)
+            d.ellipse(box(26, 38), fill=(150, 158, 168, 255))            # grey mic dot
+        _IMAGES[kind] = img.resize((64, 64), Image.LANCZOS)
+    return _IMAGES[kind]
+
+
+def _clock(secs):
+    secs = int(secs)
+    return (f"{secs // 3600}:{secs // 60 % 60:02d}:{secs % 60:02d}" if secs >= 3600
+            else f"{secs // 60}:{secs % 60:02d}")
+
+
+def status_line():
+    """What the tray is doing, in a few words (the menu's first line)."""
+    if state["recording"]:
+        return "Recording since " + time.strftime("%H:%M", time.localtime(state["started_wall"]))
+    if state["busy"]:
+        return state["status"] or "Working…"
+    return "Idle"
+
+
+_shown = {"kind": None, "menu": None}
+_icon_lock = threading.Lock()     # called from the tray, tk, recording and worker threads
 
 
 def refresh_icon():
+    """Bring the icon, tooltip and menu up to date, touching only what changed:
+    pystray writes a temp .ico and makes a new icon handle on every icon set,
+    and rebuilds the whole menu on every update_menu. Never raises — this runs
+    inside progress callbacks, where an error would fail a finished job."""
     if icon is None:
         return
-    rec, busy = state["recording"], state["busy"]
-    icon.icon = make_image(rec, busy)
-    if rec:
-        icon.title = "Meeting recorder — RECORDING"
-    elif busy:
-        icon.title = "Meeting recorder — " + (state["status"] or "working…")
-    else:
-        icon.title = "Meeting recorder — idle"
     try:
-        icon.update_menu()
-    except Exception:
-        pass
+        with _icon_lock:          # read state inside it too, or a stale view could be applied last
+            rec, busy = state["recording"], state["busy"]
+            kind = "rec" if rec else "busy" if busy else "idle"
+            if rec:
+                title = f"Meeting recorder — RECORDING {_clock(time.monotonic() - state['started'])}"
+            else:
+                title = "Meeting recorder — " + (status_line() if busy else "idle")
+            title = title[:127]   # the shell's limit; longer raises ValueError in pystray
+            menu = (kind, status_line())
+            if kind != _shown["kind"]:
+                icon.icon = make_image(kind)
+                _shown["kind"] = kind
+            if title != icon.title:
+                icon.title = title
+            if menu != _shown["menu"]:
+                icon.update_menu()
+                _shown["menu"] = menu
+    except Exception as e:
+        print(f"refresh_icon: {type(e).__name__}: {e}")
 
 
 def notify(title, msg):
@@ -109,7 +160,8 @@ def start_recording():
         wav = os.path.join(mr.AUDIO_DIR, f"{mr._ts()}.wav")
         ev = threading.Event()
         th = threading.Thread(target=record_thread_main, args=(wav, ev), daemon=True)
-        state.update(recording=True, stop_event=ev, rec_thread=th, wav=wav, started=time.monotonic())
+        state.update(recording=True, stop_event=ev, rec_thread=th, wav=wav,
+                     started=time.monotonic(), started_wall=time.time())
     th.start()
     refresh_icon()
     notify("Recording started", "Click the tray icon again to stop.")
@@ -131,7 +183,8 @@ def record_thread_main(wav, ev):
     with lock:
         state["recording"] = False
     refresh_icon()
-    ui_q.put(("ask", {"wav": wav_, "secs": secs, "peak_mic": peak_mic, "peak_sys": peak_sys}))
+    if not state["quitting"]:
+        ui_q.put(("ask", {"wav": wav_, "secs": secs, "peak_mic": peak_mic, "peak_sys": peak_sys}))
 
 
 def stop_recording():
@@ -157,7 +210,8 @@ def show_result(ok, title, body, folder=None):
         row=0, column=0, rowspan=2, padx=(16, 8), pady=16)
     tk.Label(win, text=title, font=("Segoe UI", 11, "bold")).grid(
         row=0, column=1, sticky="w", pady=(16, 0), padx=(0, 16))
-    tk.Label(win, text=body, justify="left", foreground="#333").grid(
+    tk.Label(win, text=body, justify="left", foreground="#333",
+             wraplength="390p").grid(     # points, so it scales with the display (520 px at 100%)
         row=1, column=1, sticky="w", pady=(2, 10), padx=(0, 16))
     btns = ttk.Frame(win)
     btns.grid(row=2, column=1, sticky="e", padx=16, pady=(0, 14))
@@ -214,7 +268,7 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
     title_entry.grid(row=2, column=1, sticky="w", **pad)
 
     ttk.Label(win, text="Speakers:").grid(row=3, column=0, sticky="e", **pad)
-    spk_var = tk.IntVar(value=0)
+    spk_var = tk.StringVar(value="0")
     spk = ttk.Spinbox(win, from_=0, to=12, textvariable=spk_var, width=6)
     spk.grid(row=3, column=1, sticky="w", **pad)
     ttk.Label(win, text="0 = let the model decide", foreground="#666").grid(
@@ -226,14 +280,19 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
 
     ttk.Label(win, text="Language:").grid(row=6, column=0, sticky="e", **pad)
     lang_var = tk.StringVar(value=mr.LANGUAGE)
-    ttk.Entry(win, textvariable=lang_var, width=6).grid(row=6, column=1, sticky="w", **pad)
+    ttk.Combobox(win, textvariable=lang_var, width=6,      # a list, but any code can be typed
+                 values=mr.LANGS if mr.LANGUAGE in mr.LANGS else [mr.LANGUAGE] + mr.LANGS).grid(
+        row=6, column=1, sticky="w", **pad)
 
     btns = ttk.Frame(win)
     btns.grid(row=7, column=0, columnspan=2, sticky="e", padx=12, pady=(10, 12))
 
     def submit():
         title = title_var.get().strip()
-        speakers = spk_var.get() or None
+        try:                                  # an empty or typed-over box mustn't block Transcribe
+            speakers = max(int(spk_var.get().strip() or 0), 0) or None
+        except ValueError:
+            speakers = None
         diar = diar_var.get()
         lang = lang_var.get().strip() or mr.LANGUAGE
         win.destroy()
@@ -266,7 +325,7 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
 def transcribe_worker(wav, title, speakers, diar, lang):
     def progress(msg):
         print(msg)
-        state["status"] = msg
+        state["status"] = (str(msg).strip().splitlines() or [""])[0]   # tooltip and menu: one line
         refresh_icon()
 
     with lock:
@@ -409,19 +468,28 @@ def show_name_dialog(txt, then=None, title="", new=False):
     win.focus_force()
 
 
-def pick_transcript_to_name():
+@contextlib.contextmanager
+def topmost_parent():
+    """The root is withdrawn, so a bare file dialog or message box opens behind
+    other windows and looks like "nothing happened". Give it a visible, topmost
+    parent."""
     parent = tk.Toplevel(root)
     parent.overrideredirect(True)
     parent.geometry("1x1+0+0")
     parent.attributes("-topmost", True)
     parent.update()
     try:
+        yield parent
+    finally:
+        parent.destroy()
+
+
+def pick_transcript_to_name():
+    with topmost_parent() as parent:
         path = filedialog.askopenfilename(
             parent=parent, title="Pick a transcript to name speakers in",
             initialdir=mr.OUTPUT_DIR,
             filetypes=[("Transcript", "*.txt"), ("All files", "*.*")])
-    finally:
-        parent.destroy()
     if path:
         path = os.path.normpath(path)
         if not mr.read_turns(path):
@@ -446,22 +514,56 @@ def on_name_file(icon_, item):
     ui_q.put(("pick_names", {}))
 
 
+def on_open_folder(icon_, item):
+    try:
+        os.makedirs(mr.OUTPUT_DIR, exist_ok=True)
+        os.startfile(mr.OUTPUT_DIR)
+    except Exception as e:
+        print(f"open folder: {type(e).__name__}: {e}")
+
+
 def on_quit(icon_, item):
-    if state["recording"]:
-        try:
-            state["stop_event"].set()
-        except Exception:
-            pass
-    ui_q.put(("quit", {}))
+    ui_q.put(("quit", {}))        # the tk thread asks first if a transcription is running
+
+
+def quit_app():
+    """Quit, unless a running transcription should be kept. A recording is
+    stopped and its WAV finalised first: the WAV trails real time by a few
+    seconds (mr.TIMELINE_LAG), and the process exiting under it would cut off
+    the end of the meeting. Returns False if the user cancelled."""
+    if state["busy"]:
+        with topmost_parent() as parent:
+            if not messagebox.askyesno(
+                    "Quit meeting recorder?",
+                    "A transcription is still running and will be abandoned.\n"
+                    "The audio stays saved; transcribe it again later from the tray menu.\n\n"
+                    "Quit anyway?", icon="warning", default="no", parent=parent):
+                return False
+    state["quitting"] = True
+    with lock:
+        ev, th = state["stop_event"], state["rec_thread"]
+        recording = state["recording"]
+    if recording and ev:
+        ev.set()
+        th.join(10)
+    try:
+        icon.stop()
+    except Exception:
+        pass
+    root.quit()
+    return True
 
 
 def build_menu():
     return pystray.Menu(
+        pystray.MenuItem(lambda item: status_line(), None, enabled=False),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             lambda item: "■  Stop recording" if state["recording"] else "●  Start recording",
             on_toggle, default=True),
         pystray.MenuItem("Transcribe an existing recording…", on_pick_file),
         pystray.MenuItem("Name speakers in a transcript…", on_name_file),
+        pystray.MenuItem("Open transcripts folder", on_open_folder),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
     )
@@ -510,18 +612,16 @@ def health_tick():
 # ---------------------------------------------------------------- tk pump loop
 def pump():
     health_tick()
+    if state["recording"]:
+        refresh_icon()                    # the tooltip's running clock (only changes once a second)
     try:
         while True:
             kind, payload = ui_q.get_nowait()
-            if kind == "quit":
-                try:
-                    icon.stop()
-                except Exception:
-                    pass
-                root.quit()
-                return
             try:
-                if kind == "ask":
+                if kind == "quit":
+                    if quit_app():
+                        return
+                elif kind == "ask":
                     show_transcribe_dialog(payload["wav"], payload.get("secs"),
                                            payload.get("peak_mic"), payload.get("peak_sys"))
                 elif kind == "result":
@@ -544,22 +644,13 @@ def pump():
 
 
 def pick_and_transcribe():
-    # The root is withdrawn, so a bare file dialog opens behind other windows and
-    # looks like "nothing happened". Give it a visible, topmost parent.
-    parent = tk.Toplevel(root)
-    parent.overrideredirect(True)
-    parent.geometry("1x1+0+0")
-    parent.attributes("-topmost", True)
-    parent.update()
-    try:
+    with topmost_parent() as parent:
         path = filedialog.askopenfilename(
             parent=parent,
             title="Pick a recording to transcribe",
             initialdir=mr.AUDIO_DIR if os.path.isdir(mr.AUDIO_DIR) else None,
             filetypes=[("Audio", "*.wav *.mp3 *.m4a *.ogg *.opus *.flac *.webm *.aac"),
                        ("All files", "*.*")])
-    finally:
-        parent.destroy()
     print(f"pick: {path!r}")
     if path:
         show_transcribe_dialog(os.path.normpath(path))
@@ -569,7 +660,8 @@ def main():
     global icon, root
     root = tk.Tk()
     root.withdraw()                       # no main window; we live in the tray
-    icon = pystray.Icon("meeting_recorder", make_image(False), "Meeting recorder — idle", build_menu())
+    icon = pystray.Icon("meeting_recorder", make_image("idle"), "Meeting recorder — idle", build_menu())
+    _shown.update(kind="idle", menu=("idle", status_line()))
     icon.run_detached()                   # tray in its own thread
     root.after(150, pump)                 # tk owns the main thread (dialogs need it)
     root.mainloop()

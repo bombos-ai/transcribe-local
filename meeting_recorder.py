@@ -38,6 +38,11 @@ Settings come from environment variables or a .env file next to this script
 Deps:  pip install -r requirements.txt   (plus the `docker` CLI on PATH for Docker mode)
 """
 import argparse, atexit, collections, contextlib, ctypes, datetime, os, re, signal, subprocess, sys, threading, time, urllib.parse, wave, json, warnings
+# numpy's OpenBLAS starts a worker per CPU core, each committing a large
+# buffer (~700 MB on a 22-core machine), for matrix maths this never does.
+# Only for this process: the server we launch doesn't inherit it (_server_env).
+_OUR_OPENBLAS_CAP = "OPENBLAS_NUM_THREADS" not in os.environ
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import numpy as np
 import requests
 
@@ -77,6 +82,7 @@ AUDIO_DIR   = os.path.join(OUTPUT_DIR, "recordings")  # WAVs kept here
 # (e.g. a notes app's or knowledge base's inbox). Off when unset.
 INBOX_DIR   = os.environ.get("TRANSCRIPTION_INBOX_DIR") or None
 LANGUAGE    = os.environ.get("TRANSCRIPTION_LANGUAGE") or "nl"
+LANGS       = ["nl", "en", "de", "fr", "es", "it", "pt", "pl", "sv", "da", "no", "fi"]   # the trays' language list
 CAPTURE_SR  = 48000          # WASAPI native; the macOS helper resamples to it
 TARGET_SR   = 16000          # what we send (48000/16000 = 3, clean decimation)
 DECIM       = CAPTURE_SR // TARGET_SR
@@ -297,6 +303,21 @@ MIC, SYSTEM  = 0, 1          # timeline / WAV channels
 _CH_NAMES    = ("mic", "system")
 
 
+def _antialias(taps=95, beta=5.65):
+    """Low-pass for the CAPTURE_SR -> TARGET_SR decimation: a Kaiser-windowed
+    sinc at TARGET_SR's Nyquist (8 kHz). Flat to 7 kHz and >= 59 dB down from
+    9 kHz, so nothing above 8 kHz folds back into the speech band. (A plain
+    3-sample average lets 9-24 kHz, sibilants included, through only ~5 dB
+    down.) Its ~1 ms delay is the same on every stream, so mic and system stay
+    aligned."""
+    n = np.arange(taps) - (taps - 1) / 2
+    h = np.sinc(2 * (TARGET_SR / 2) / CAPTURE_SR * n) * np.kaiser(taps, beta)
+    return (h / h.sum()).astype(np.float32)
+
+
+_AA = _antialias()
+
+
 class _Timeline:
     """Two channels (MIC, SYSTEM) at TARGET_SR, indexed by frames since t0 on
     the monotonic clock. Streams add into it; the writer pops finished frames
@@ -356,6 +377,8 @@ class _Source:
         self.pos = None                           # timeline frame for the next block
         self.last = None                          # when the last block arrived
         self.delays = collections.deque(maxlen=SYNC_WINDOW)
+        self.fir = np.zeros(len(_AA) - 1, np.float32)    # the previous block's tail, for the filter
+        self.phase = 0                            # which filtered sample is the next one kept
         self.started_at = time.monotonic()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -375,9 +398,10 @@ class _Source:
 
     def _place(self, block, arrived):
         self.last = arrived
-        x = block.mean(axis=1)
-        n = (len(x) // DECIM) * DECIM
-        x = x[:n].reshape(-1, DECIM).mean(axis=1)
+        x = np.concatenate([self.fir, block.mean(axis=1, dtype=np.float32)])
+        self.fir = x[-(len(_AA) - 1):]
+        x = np.convolve(x, _AA, "valid")[self.phase::DECIM]      # low-pass, keep every DECIM-th
+        self.phase = (self.phase - len(block)) % DECIM
         end = self.tl.frame(arrived)
         if self.pos is None:
             self.pos = end - len(x)
@@ -873,12 +897,21 @@ def _compose_cmd(*args):
     return ["docker", "compose", *files, *args]
 
 
+def _server_env(**extra):
+    """Our environment for the server, minus the OpenBLAS thread cap we set for
+    ourselves: the server does real matrix maths (diarization clustering)."""
+    env = dict(os.environ, **extra)
+    if _OUR_OPENBLAS_CAP:
+        env.pop("OPENBLAS_NUM_THREADS", None)
+    return env
+
+
 def _compose_env():
     """The server's diarization model needs a Hugging Face token. A manual
     checkout's .env often leaves HUGGINGFACE_TOKEN empty, so pass ours (HF_TOKEN
     or HUGGINGFACE_TOKEN from the environment or our .env) through; compose
     prefers the process environment over its .env file."""
-    env = dict(os.environ)
+    env = _server_env()
     tok = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
     if tok:
         env["HUGGINGFACE_TOKEN"] = tok
@@ -941,7 +974,7 @@ def _metal_env():
     data = os.path.join(TS_DATA_DIR, "data")
     for d in ("logs", "audio", "tokens"):
         os.makedirs(os.path.join(data, d), exist_ok=True)
-    env = dict(os.environ, DATA_DIR=data, HF_HOME=os.path.join(TS_DATA_DIR, "models"),
+    env = _server_env(DATA_DIR=data, HF_HOME=os.path.join(TS_DATA_DIR, "models"),
                USER_CONFIG_DIR=os.path.join(TS_DATA_DIR, "server-config"),
                LOG_DIR=os.path.join(data, "logs"), LOG_LEVEL="INFO", PYTHONUNBUFFERED="1")
     ffmpeg = os.path.join(os.path.dirname(_metal_backend_dir()), "ffmpeg")   # bundled fallback
@@ -1250,6 +1283,59 @@ def transcribe_file(wav_path, language=LANGUAGE, diarization=True, expected_spea
                 os.remove(upload)
 
 
+class _StreamedForm:
+    """A multipart/form-data body (plain fields plus one file) that streams the
+    file from disk. requests' own files= reads the whole file into memory and
+    then copies it into the body: ~600 MB at once for a 2.5 h meeting. It can
+    seek, so requests can rewind it to re-send it after a 307/308 redirect."""
+
+    def __init__(self, fields, field, filename, path, mime):
+        boundary = os.urandom(16).hex()
+        filename = filename.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A")
+        head = "".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+                       for k, v in fields.items())
+        head += (f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+                 f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n')
+        self._head, self._tail = head.encode("utf-8"), f"\r\n--{boundary}--\r\n".encode()
+        self._size = os.path.getsize(path)
+        self.content_type = f"multipart/form-data; boundary={boundary}"
+        self.len = len(self._head) + self._size + len(self._tail)   # requests sends it as Content-Length
+        self._fh = open(path, "rb")
+        self._pos = 0
+
+    def read(self, n=-1):
+        left = self.len - self._pos if n is None or n < 0 else min(n, self.len - self._pos)
+        out = []
+        while left > 0:
+            p, file_end = self._pos, len(self._head) + self._size
+            if p < len(self._head):
+                chunk = self._head[p:p + left]
+            elif p < file_end:
+                self._fh.seek(p - len(self._head))
+                chunk = self._fh.read(min(left, file_end - p))
+                if not chunk:
+                    raise OSError(f"{self._fh.name} shrank while uploading")
+            else:
+                chunk = self._tail[p - file_end:p - file_end + left]
+            out.append(chunk)
+            self._pos += len(chunk)
+            left -= len(chunk)
+        return b"".join(out)
+
+    def __iter__(self):                 # makes requests treat it as a stream, the only kind it rewinds
+        return iter(lambda: self.read(1 << 16), b"")
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=0):
+        self._pos = max(0, offset + (0, self._pos, self.len)[whence])
+        return self._pos
+
+    def close(self):
+        self._fh.close()
+
+
 def _transcribe_request(wav_path, upload, language, diarization, expected_speakers):
     """POST the (mixed) audio to the server and return the result dict. Handles
     both the synchronous /audio response and a job-based fallback."""
@@ -1266,9 +1352,9 @@ def _transcribe_request(wav_path, upload, language, diarization, expected_speake
     name = os.path.basename(wav_path) if upload == wav_path else \
         os.path.splitext(os.path.basename(wav_path))[0] + ".wav"
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    with open(upload, "rb") as fh:
-        files = {"file": (name, fh, mime)}
-        r = requests.post(url, data=data, files=files, timeout=(15, SERVER_TIMEOUT))
+    with contextlib.closing(_StreamedForm(data, "file", name, upload, mime)) as form:
+        r = requests.post(url, data=form, headers={"Content-Type": form.content_type},
+                          timeout=(15, SERVER_TIMEOUT))
     r.raise_for_status()
     result = r.json()
     if "text" in result:
